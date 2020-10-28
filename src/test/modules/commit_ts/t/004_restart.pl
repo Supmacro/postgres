@@ -45,7 +45,7 @@ my $xid = $node_master->safe_psql(
 	'postgres', qq[
 	BEGIN;
 	INSERT INTO committs_test(x, y) VALUES (1, current_timestamp);
-	SELECT pg_current_xact_id()::xid;
+	SELECT txid_current();
 	COMMIT;
 ]);
 
@@ -93,7 +93,7 @@ DECLARE
     i int;
     BEGIN
         FOR i in 1..cnt LOOP
-            EXECUTE 'SELECT pg_current_xact_id()';
+            EXECUTE 'SELECT txid_current()';
             COMMIT;
         END LOOP;
     END;
@@ -115,7 +115,7 @@ my $xid_disabled = $node_master->safe_psql(
 	'postgres', qq[
 	BEGIN;
 	INSERT INTO committs_test(x, y) VALUES (2, current_timestamp);
-	SELECT pg_current_xact_id();
+	SELECT txid_current();
 	COMMIT;
 ]);
 

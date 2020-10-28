@@ -7,7 +7,7 @@
  *	AccessExclusiveLocks and starting snapshots for Hot Standby mode.
  *	Plus conflict recovery processing.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -43,9 +43,7 @@ int			max_standby_streaming_delay = 30 * 1000;
 static HTAB *RecoveryLockLists;
 
 static void ResolveRecoveryConflictWithVirtualXIDs(VirtualTransactionId *waitlist,
-												   ProcSignalReason reason,
-												   uint32 wait_event_info,
-												   bool report_waiting);
+												   ProcSignalReason reason, bool report_waiting);
 static void SendRecoveryConflictWithBufferPin(ProcSignalReason reason);
 static XLogRecPtr LogCurrentRunningXacts(RunningTransactions CurrRunningXacts);
 static void LogAccessExclusiveLocks(int nlocks, xl_standby_lock *locks);
@@ -101,7 +99,7 @@ InitRecoveryTransactionEnvironment(void)
 	 * Lock a virtual transaction id for Startup process.
 	 *
 	 * We need to do GetNextLocalTransactionId() because
-	 * SharedInvalBackendInit() leaves localTransactionId invalid and the lock
+	 * SharedInvalBackendInit() leaves localTransactionid invalid and the lock
 	 * manager doesn't like that at all.
 	 *
 	 * Note that we don't need to run XactLockTableInsert() because nobody
@@ -186,7 +184,7 @@ static int	standbyWait_us = STANDBY_INITIAL_WAIT_US;
  * more then we return true, if we can wait some more return false.
  */
 static bool
-WaitExceedsMaxStandbyDelay(uint32 wait_event_info)
+WaitExceedsMaxStandbyDelay(void)
 {
 	TimestampTz ltime;
 
@@ -200,9 +198,7 @@ WaitExceedsMaxStandbyDelay(uint32 wait_event_info)
 	/*
 	 * Sleep a bit (this is essential to avoid busy-waiting).
 	 */
-	pgstat_report_wait_start(wait_event_info);
 	pg_usleep(standbyWait_us);
-	pgstat_report_wait_end();
 
 	/*
 	 * Progressively increase the sleep times, but not to more than 1s, since
@@ -227,8 +223,7 @@ WaitExceedsMaxStandbyDelay(uint32 wait_event_info)
  */
 static void
 ResolveRecoveryConflictWithVirtualXIDs(VirtualTransactionId *waitlist,
-									   ProcSignalReason reason, uint32 wait_event_info,
-									   bool report_waiting)
+									   ProcSignalReason reason, bool report_waiting)
 {
 	TimestampTz waitStart = 0;
 	char	   *new_status;
@@ -264,12 +259,12 @@ ResolveRecoveryConflictWithVirtualXIDs(VirtualTransactionId *waitlist,
 				new_status = (char *) palloc(len + 8 + 1);
 				memcpy(new_status, old_status, len);
 				strcpy(new_status + len, " waiting");
-				set_ps_display(new_status);
+				set_ps_display(new_status, false);
 				new_status[len] = '\0'; /* truncate off " waiting" */
 			}
 
 			/* Is it time to kill it? */
-			if (WaitExceedsMaxStandbyDelay(wait_event_info))
+			if (WaitExceedsMaxStandbyDelay())
 			{
 				pid_t		pid;
 
@@ -295,7 +290,7 @@ ResolveRecoveryConflictWithVirtualXIDs(VirtualTransactionId *waitlist,
 	/* Reset ps display if we changed it */
 	if (new_status)
 	{
-		set_ps_display(new_status);
+		set_ps_display(new_status, false);
 		pfree(new_status);
 	}
 }
@@ -322,7 +317,6 @@ ResolveRecoveryConflictWithSnapshot(TransactionId latestRemovedXid, RelFileNode 
 
 	ResolveRecoveryConflictWithVirtualXIDs(backends,
 										   PROCSIG_RECOVERY_CONFLICT_SNAPSHOT,
-										   WAIT_EVENT_RECOVERY_CONFLICT_SNAPSHOT,
 										   true);
 }
 
@@ -352,7 +346,6 @@ ResolveRecoveryConflictWithTablespace(Oid tsid)
 												InvalidOid);
 	ResolveRecoveryConflictWithVirtualXIDs(temp_file_users,
 										   PROCSIG_RECOVERY_CONFLICT_TABLESPACE,
-										   WAIT_EVENT_RECOVERY_CONFLICT_TABLESPACE,
 										   true);
 }
 
@@ -424,7 +417,6 @@ ResolveRecoveryConflictWithLock(LOCKTAG locktag)
 		 */
 		ResolveRecoveryConflictWithVirtualXIDs(backends,
 											   PROCSIG_RECOVERY_CONFLICT_LOCK,
-											   PG_WAIT_LOCK | locktag.locktag_type,
 											   false);
 	}
 	else

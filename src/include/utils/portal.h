@@ -36,7 +36,7 @@
  * to look like NO SCROLL cursors.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/portal.h
@@ -48,7 +48,6 @@
 
 #include "datatype/timestamp.h"
 #include "executor/execdesc.h"
-#include "tcop/cmdtag.h"
 #include "utils/plancache.h"
 #include "utils/resowner.h"
 
@@ -133,8 +132,7 @@ typedef struct PortalData
 
 	/* The query or queries the portal will execute */
 	const char *sourceText;		/* text of query (as of 8.4, never NULL) */
-	CommandTag	commandTag;		/* command tag for original query */
-	QueryCompletion qc;			/* command completion data for executed query */
+	const char *commandTag;		/* command tag for original query */
 	List	   *stmts;			/* list of PlannedStmts */
 	CachedPlan *cplan;			/* CachedPlan, if stmts are from one */
 
@@ -229,7 +227,7 @@ extern Portal GetPortalByName(const char *name);
 extern void PortalDefineQuery(Portal portal,
 							  const char *prepStmtName,
 							  const char *sourceText,
-							  CommandTag commandTag,
+							  const char *commandTag,
 							  List *stmts,
 							  CachedPlan *cplan);
 extern PlannedStmt *PortalGetPrimaryStmt(Portal portal);

@@ -4,7 +4,7 @@
  *	  postgres transaction access method support code
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/transam.h
@@ -47,11 +47,7 @@
 #define EpochFromFullTransactionId(x)	((uint32) ((x).value >> 32))
 #define XidFromFullTransactionId(x)		((uint32) (x).value)
 #define U64FromFullTransactionId(x)		((x).value)
-#define FullTransactionIdEquals(a, b)	((a).value == (b).value)
 #define FullTransactionIdPrecedes(a, b)	((a).value < (b).value)
-#define FullTransactionIdPrecedesOrEquals(a, b) ((a).value <= (b).value)
-#define FullTransactionIdFollows(a, b) ((a).value > (b).value)
-#define FullTransactionIdFollowsOrEquals(a, b) ((a).value >= (b).value)
 #define FullTransactionIdIsValid(x)		TransactionIdIsValid(XidFromFullTransactionId(x))
 #define InvalidFullTransactionId		FullTransactionIdFromEpochAndXid(0, InvalidTransactionId)
 
@@ -71,16 +67,6 @@ FullTransactionIdFromEpochAndXid(uint32 epoch, TransactionId xid)
 	FullTransactionId result;
 
 	result.value = ((uint64) epoch) << 32 | xid;
-
-	return result;
-}
-
-static inline FullTransactionId
-FullTransactionIdFromU64(uint64 value)
-{
-	FullTransactionId result;
-
-	result.value = value;
 
 	return result;
 }
@@ -197,7 +183,7 @@ typedef struct VariableCacheData
 										 * aborted */
 
 	/*
-	 * These fields are protected by XactTruncationLock
+	 * These fields are protected by CLogTruncationLock
 	 */
 	TransactionId oldestClogXid;	/* oldest it's safe to look up in clog */
 
@@ -223,6 +209,7 @@ extern PGDLLIMPORT VariableCache ShmemVariableCache;
 extern bool TransactionIdDidCommit(TransactionId transactionId);
 extern bool TransactionIdDidAbort(TransactionId transactionId);
 extern bool TransactionIdIsKnownCompleted(TransactionId transactionId);
+extern void TransactionIdAbort(TransactionId transactionId);
 extern void TransactionIdCommitTree(TransactionId xid, int nxids, TransactionId *xids);
 extern void TransactionIdAsyncCommitTree(TransactionId xid, int nxids, TransactionId *xids, XLogRecPtr lsn);
 extern void TransactionIdAbortTree(TransactionId xid, int nxids, TransactionId *xids);

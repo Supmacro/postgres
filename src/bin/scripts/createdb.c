@@ -2,7 +2,7 @@
  *
  * createdb
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/scripts/createdb.c
@@ -277,6 +277,5 @@ help(const char *progname)
 	printf(_("  -W, --password               force password prompt\n"));
 	printf(_("  --maintenance-db=DBNAME      alternate maintenance database\n"));
 	printf(_("\nBy default, a database with the same name as the current user is created.\n"));
-	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);
-	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
+	printf(_("\nReport bugs to <pgsql-bugs@lists.postgresql.org>.\n"));
 }

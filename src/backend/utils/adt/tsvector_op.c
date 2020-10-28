@@ -3,7 +3,7 @@
  * tsvector_op.c
  *	  operations over tsvector
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -21,12 +21,10 @@
 #include "commands/trigger.h"
 #include "executor/spi.h"
 #include "funcapi.h"
-#include "lib/qunique.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "parser/parse_coerce.h"
 #include "tsearch/ts_utils.h"
-#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/regproc.h"
@@ -316,7 +314,7 @@ tsvector_setweight_by_filter(PG_FUNCTION_ARGS)
 	memcpy(tsout, tsin, VARSIZE(tsin));
 	entry = ARRPTR(tsout);
 
-	deconstruct_array(lexemes, TEXTOID, -1, false, TYPALIGN_INT,
+	deconstruct_array(lexemes, TEXTOID, -1, false, 'i',
 					  &dlexemes, &nulls, &nlexemes);
 
 	/*
@@ -489,9 +487,16 @@ tsvector_delete_by_indices(TSVector tsv, int *indices_to_delete,
 	 */
 	if (indices_count > 1)
 	{
+		int			kp;
+
 		qsort(indices_to_delete, indices_count, sizeof(int), compare_int);
-		indices_count = qunique(indices_to_delete, indices_count, sizeof(int),
-								compare_int);
+		kp = 0;
+		for (k = 1; k < indices_count; k++)
+		{
+			if (indices_to_delete[k] != indices_to_delete[kp])
+				indices_to_delete[++kp] = indices_to_delete[k];
+		}
+		indices_count = ++kp;
 	}
 
 	/*
@@ -595,7 +600,7 @@ tsvector_delete_arr(PG_FUNCTION_ARGS)
 	Datum	   *dlexemes;
 	bool	   *nulls;
 
-	deconstruct_array(lexemes, TEXTOID, -1, false, TYPALIGN_INT,
+	deconstruct_array(lexemes, TEXTOID, -1, false, 'i',
 					  &dlexemes, &nulls, &nlex);
 
 	/*
@@ -679,7 +684,9 @@ tsvector_unnest(PG_FUNCTION_ARGS)
 		bool		nulls[] = {false, false, false};
 		Datum		values[3];
 
-		values[0] = PointerGetDatum(cstring_to_text_with_len(data + arrin[i].pos, arrin[i].len));
+		values[0] = PointerGetDatum(
+									cstring_to_text_with_len(data + arrin[i].pos, arrin[i].len)
+			);
 
 		if (arrin[i].haspos)
 		{
@@ -700,14 +707,15 @@ tsvector_unnest(PG_FUNCTION_ARGS)
 			{
 				positions[j] = Int16GetDatum(WEP_GETPOS(posv->pos[j]));
 				weight = 'D' - WEP_GETWEIGHT(posv->pos[j]);
-				weights[j] = PointerGetDatum(cstring_to_text_with_len(&weight,
-																	  1));
+				weights[j] = PointerGetDatum(
+											 cstring_to_text_with_len(&weight, 1)
+					);
 			}
 
-			values[1] = PointerGetDatum(construct_array(positions, posv->npos,
-														INT2OID, 2, true, TYPALIGN_SHORT));
-			values[2] = PointerGetDatum(construct_array(weights, posv->npos,
-														TEXTOID, -1, false, TYPALIGN_INT));
+			values[1] = PointerGetDatum(
+										construct_array(positions, posv->npos, INT2OID, 2, true, 's'));
+			values[2] = PointerGetDatum(
+										construct_array(weights, posv->npos, TEXTOID, -1, false, 'i'));
 		}
 		else
 		{
@@ -719,6 +727,7 @@ tsvector_unnest(PG_FUNCTION_ARGS)
 	}
 	else
 	{
+		pfree(tsin);
 		SRF_RETURN_DONE(funcctx);
 	}
 }
@@ -739,11 +748,12 @@ tsvector_to_array(PG_FUNCTION_ARGS)
 
 	for (i = 0; i < tsin->size; i++)
 	{
-		elements[i] = PointerGetDatum(cstring_to_text_with_len(STRPTR(tsin) + arrin[i].pos,
-															   arrin[i].len));
+		elements[i] = PointerGetDatum(
+									  cstring_to_text_with_len(STRPTR(tsin) + arrin[i].pos, arrin[i].len)
+			);
 	}
 
-	array = construct_array(elements, tsin->size, TEXTOID, -1, false, TYPALIGN_INT);
+	array = construct_array(elements, tsin->size, TEXTOID, -1, false, 'i');
 
 	pfree(elements);
 	PG_FREE_IF_COPY(tsin, 0);
@@ -763,11 +773,12 @@ array_to_tsvector(PG_FUNCTION_ARGS)
 	bool	   *nulls;
 	int			nitems,
 				i,
+				j,
 				tslen,
 				datalen = 0;
 	char	   *cur;
 
-	deconstruct_array(v, TEXTOID, -1, false, TYPALIGN_INT, &dlexemes, &nulls, &nitems);
+	deconstruct_array(v, TEXTOID, -1, false, 'i', &dlexemes, &nulls, &nitems);
 
 	/* Reject nulls (maybe we should just ignore them, instead?) */
 	for (i = 0; i < nitems; i++)
@@ -782,8 +793,13 @@ array_to_tsvector(PG_FUNCTION_ARGS)
 	if (nitems > 1)
 	{
 		qsort(dlexemes, nitems, sizeof(Datum), compare_text_lexemes);
-		nitems = qunique(dlexemes, nitems, sizeof(Datum),
-						 compare_text_lexemes);
+		j = 0;
+		for (i = 1; i < nitems; i++)
+		{
+			if (compare_text_lexemes(&dlexemes[j], &dlexemes[i]) < 0)
+				dlexemes[++j] = dlexemes[i];
+		}
+		nitems = ++j;
 	}
 
 	/* Calculate space needed for surviving lexemes. */
@@ -835,7 +851,7 @@ tsvector_filter(PG_FUNCTION_ARGS)
 	int			cur_pos = 0;
 	char		mask = 0;
 
-	deconstruct_array(weights, CHAROID, 1, true, TYPALIGN_CHAR,
+	deconstruct_array(weights, CHAROID, 1, true, 'c',
 					  &dweights, &nulls, &nweights);
 
 	for (i = 0; i < nweights; i++)
@@ -1149,7 +1165,7 @@ tsvector_concat(PG_FUNCTION_ARGS)
 /*
  * Compare two strings by tsvector rules.
  *
- * if prefix = true then it returns zero value iff b has prefix a
+ * if isPrefix = true then it returns zero value iff b has prefix a
  */
 int32
 tsCompareString(char *a, int lena, char *b, int lenb, bool prefix)
@@ -1267,6 +1283,39 @@ checkclass_str(CHKVAL *chkval, WordEntry *entry, QueryOperand *val,
 }
 
 /*
+ * Removes duplicate pos entries. We can't use uniquePos() from
+ * tsvector.c because array might be longer than MAXENTRYPOS
+ *
+ * Returns new length.
+ */
+static int
+uniqueLongPos(WordEntryPos *pos, int npos)
+{
+	WordEntryPos *pos_iter,
+			   *result;
+
+	if (npos <= 1)
+		return npos;
+
+	qsort((void *) pos, npos, sizeof(WordEntryPos), compareWordEntryPos);
+
+	result = pos;
+	pos_iter = pos + 1;
+	while (pos_iter < pos + npos)
+	{
+		if (WEP_GETPOS(*pos_iter) != WEP_GETPOS(*result))
+		{
+			result++;
+			*result = WEP_GETPOS(*pos_iter);
+		}
+
+		pos_iter++;
+	}
+
+	return result + 1 - pos;
+}
+
+/*
  * is there value 'val' in array or not ?
  */
 static bool
@@ -1366,9 +1415,7 @@ checkcondition_str(void *checkval, QueryOperand *val, ExecPhraseData *data)
 		{
 			/* Sort and make unique array of found positions */
 			data->pos = allpos;
-			qsort(data->pos, npos, sizeof(WordEntryPos), compareWordEntryPos);
-			data->npos = qunique(data->pos, npos, sizeof(WordEntryPos),
-								 compareWordEntryPos);
+			data->npos = uniqueLongPos(allpos, npos);
 			data->allocated = true;
 		}
 	}
@@ -1818,6 +1865,9 @@ TS_execute_recurse(QueryItem *curitem, void *arg, uint32 flags,
 
 	/* since this function recurses, it could be driven to stack overflow */
 	check_stack_depth();
+
+	/* ... and let's check for query cancel while we're at it */
+	CHECK_FOR_INTERRUPTS();
 
 	if (curitem->type == QI_VAL)
 		return chkcond(arg, (QueryOperand *) curitem,
@@ -2512,7 +2562,6 @@ tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column)
 	bool		isnull;
 	text	   *txt;
 	Oid			cfgId;
-	bool		update_needed;
 
 	/* Check call context */
 	if (!CALLED_AS_TRIGGER(fcinfo)) /* internal error */
@@ -2525,15 +2574,9 @@ tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column)
 		elog(ERROR, "tsvector_update_trigger: must be fired BEFORE event");
 
 	if (TRIGGER_FIRED_BY_INSERT(trigdata->tg_event))
-	{
 		rettuple = trigdata->tg_trigtuple;
-		update_needed = true;
-	}
 	else if (TRIGGER_FIRED_BY_UPDATE(trigdata->tg_event))
-	{
 		rettuple = trigdata->tg_newtuple;
-		update_needed = false;	/* computed below */
-	}
 	else
 		elog(ERROR, "tsvector_update_trigger: must be fired for INSERT or UPDATE");
 
@@ -2621,9 +2664,6 @@ tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column)
 					 errmsg("column \"%s\" is not of a character type",
 							trigger->tgargs[i])));
 
-		if (bms_is_member(numattr - FirstLowInvalidHeapAttributeNumber, trigdata->tg_updatedcols))
-			update_needed = true;
-
 		datum = SPI_getbinval(rettuple, rel->rd_att, numattr, &isnull);
 		if (isnull)
 			continue;
@@ -2636,19 +2676,16 @@ tsvector_update_trigger(PG_FUNCTION_ARGS, bool config_column)
 			pfree(txt);
 	}
 
-	if (update_needed)
-	{
-		/* make tsvector value */
-		datum = TSVectorGetDatum(make_tsvector(&prs));
-		isnull = false;
+	/* make tsvector value */
+	datum = TSVectorGetDatum(make_tsvector(&prs));
+	isnull = false;
 
-		/* and insert it into tuple */
-		rettuple = heap_modify_tuple_by_cols(rettuple, rel->rd_att,
-											 1, &tsvector_attr_num,
-											 &datum, &isnull);
+	/* and insert it into tuple */
+	rettuple = heap_modify_tuple_by_cols(rettuple, rel->rd_att,
+										 1, &tsvector_attr_num,
+										 &datum, &isnull);
 
-		pfree(DatumGetPointer(datum));
-	}
+	pfree(DatumGetPointer(datum));
 
 	return PointerGetDatum(rettuple);
 }

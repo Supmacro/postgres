@@ -3,7 +3,7 @@
  * indexcmds.c
  *	  POSTGRES define and remove index code.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -90,7 +90,6 @@ static void RangeVarCallbackForReindexIndex(const RangeVar *relation,
 static bool ReindexRelationConcurrently(Oid relationOid, int options);
 static void ReindexPartitionedIndex(Relation parentIdx);
 static void update_relispartition(Oid relationId, bool newval);
-static bool CompareOpclassOptions(Datum *opts1, Datum *opts2, int natts);
 
 /*
  * callback argument type for RangeVarCallbackForReindexIndex()
@@ -269,18 +268,6 @@ CheckIndexCompatible(Oid oldId,
 		}
 	}
 
-	/* Any change in opclass options break compatibility. */
-	if (ret)
-	{
-		Datum	   *opclassOptions = RelationGetIndexRawAttOptions(irel);
-
-		ret = CompareOpclassOptions(opclassOptions,
-									indexInfo->ii_OpclassOptions, old_natts);
-
-		if (opclassOptions)
-			pfree(opclassOptions);
-	}
-
 	/* Any change in exclusion operator selections breaks compatibility. */
 	if (ret && indexInfo->ii_ExclusionOps != NULL)
 	{
@@ -315,42 +302,6 @@ CheckIndexCompatible(Oid oldId,
 	return ret;
 }
 
-/*
- * CompareOpclassOptions
- *
- * Compare per-column opclass options which are represented by arrays of text[]
- * datums.  Both elements of arrays and array themselves can be NULL.
- */
-static bool
-CompareOpclassOptions(Datum *opts1, Datum *opts2, int natts)
-{
-	int			i;
-
-	if (!opts1 && !opts2)
-		return true;
-
-	for (i = 0; i < natts; i++)
-	{
-		Datum		opt1 = opts1 ? opts1[i] : (Datum) 0;
-		Datum		opt2 = opts2 ? opts2[i] : (Datum) 0;
-
-		if (opt1 == (Datum) 0)
-		{
-			if (opt2 == (Datum) 0)
-				continue;
-			else
-				return false;
-		}
-		else if (opt2 == (Datum) 0)
-			return false;
-
-		/* Compare non-NULL text[] datums. */
-		if (!DatumGetBool(DirectFunctionCall2(array_eq, opt1, opt2)))
-			return false;
-	}
-
-	return true;
-}
 
 /*
  * WaitForOlderSnapshots
@@ -580,8 +531,8 @@ DefineIndex(Oid relationId,
 	 * is part of the key columns, and anything equal to and over is part of
 	 * the INCLUDE columns.
 	 */
-	allIndexParams = list_concat_copy(stmt->indexParams,
-									  stmt->indexIncludingParams);
+	allIndexParams = list_concat(list_copy(stmt->indexParams),
+								 list_copy(stmt->indexIncludingParams));
 	numberOfAttributes = list_length(allIndexParams);
 
 	if (numberOfAttributes <= 0)
@@ -1180,8 +1131,9 @@ DefineIndex(Oid relationId,
 				Relation	childrel;
 				List	   *childidxs;
 				ListCell   *cell;
-				AttrMap    *attmap;
+				AttrNumber *attmap;
 				bool		found = false;
+				int			maplen;
 
 				childrel = table_open(childRelid, lockmode);
 
@@ -1206,8 +1158,10 @@ DefineIndex(Oid relationId,
 
 				childidxs = RelationGetIndexList(childrel);
 				attmap =
-					build_attrmap_by_name(RelationGetDescr(childrel),
-										  parentDesc);
+					convert_tuples_by_name_map(RelationGetDescr(childrel),
+											   parentDesc,
+											   gettext_noop("could not convert row type"));
+				maplen = parentDesc->natts;
 
 				foreach(cell, childidxs)
 				{
@@ -1226,7 +1180,7 @@ DefineIndex(Oid relationId,
 										 collationObjectId,
 										 cldidx->rd_opfamily,
 										 opfamOids,
-										 attmap))
+										 attmap, maplen))
 					{
 						Oid			cldConstrOid = InvalidOid;
 
@@ -1293,8 +1247,6 @@ DefineIndex(Oid relationId,
 					childStmt->relation = NULL;
 					childStmt->indexOid = InvalidOid;
 					childStmt->oldNode = InvalidOid;
-					childStmt->oldCreateSubid = InvalidSubTransactionId;
-					childStmt->oldFirstRelfilenodeSubid = InvalidSubTransactionId;
 
 					/*
 					 * Adjust any Vars (both in expressions and in the index's
@@ -1313,7 +1265,7 @@ DefineIndex(Oid relationId,
 						{
 							ielem->expr =
 								map_variable_attnos((Node *) ielem->expr,
-													1, 0, attmap,
+													1, 0, attmap, maplen,
 													InvalidOid,
 													&found_whole_row);
 							if (found_whole_row)
@@ -1322,7 +1274,7 @@ DefineIndex(Oid relationId,
 					}
 					childStmt->whereClause =
 						map_variable_attnos(stmt->whereClause, 1, 0,
-											attmap,
+											attmap, maplen,
 											InvalidOid, &found_whole_row);
 					if (found_whole_row)
 						elog(ERROR, "cannot convert whole-row table reference");
@@ -1337,7 +1289,7 @@ DefineIndex(Oid relationId,
 
 				pgstat_progress_update_param(PROGRESS_CREATEIDX_PARTITIONS_DONE,
 											 i + 1);
-				free_attrmap(attmap);
+				pfree(attmap);
 			}
 
 			/*
@@ -1631,7 +1583,7 @@ CheckPredicate(Expr *predicate)
 
 /*
  * Compute per-index-column information, including indexed column numbers
- * or index expressions, opclasses and their options. Note, all output vectors
+ * or index expressions, opclasses, and indoptions. Note, all output vectors
  * should be allocated for all columns, including "including" ones.
  */
 static void
@@ -1894,7 +1846,7 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 			indexInfo->ii_ExclusionOps[attn] = opid;
 			indexInfo->ii_ExclusionProcs[attn] = get_opcode(opid);
 			indexInfo->ii_ExclusionStrats[attn] = strat;
-			nextExclOp = lnext(exclusionOpNames, nextExclOp);
+			nextExclOp = lnext(nextExclOp);
 		}
 
 		/*
@@ -1932,20 +1884,6 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 								accessMethodName)));
 		}
 
-		/* Set up the per-column opclass options (attoptions field). */
-		if (attribute->opclassopts)
-		{
-			Assert(attn < nkeycols);
-
-			if (!indexInfo->ii_OpclassOptions)
-				indexInfo->ii_OpclassOptions =
-					palloc0(sizeof(Datum) * indexInfo->ii_NumIndexAttrs);
-
-			indexInfo->ii_OpclassOptions[attn] =
-				transformRelOptions((Datum) 0, attribute->opclassopts,
-									NULL, NULL, false, false);
-		}
-
 		attn++;
 	}
 }
@@ -1953,7 +1891,7 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 /*
  * Resolve possibly-defaulted operator class specification
  *
- * Note: This is used to resolve operator class specifications in index and
+ * Note: This is used to resolve operator class specification in index and
  * partition key definitions.
  */
 Oid
@@ -1966,6 +1904,34 @@ ResolveOpClass(List *opclass, Oid attrType,
 	Form_pg_opclass opform;
 	Oid			opClassId,
 				opInputType;
+
+	/*
+	 * Release 7.0 removed network_ops, timespan_ops, and datetime_ops, so we
+	 * ignore those opclass names so the default *_ops is used.  This can be
+	 * removed in some later release.  bjm 2000/02/07
+	 *
+	 * Release 7.1 removes lztext_ops, so suppress that too for a while.  tgl
+	 * 2000/07/30
+	 *
+	 * Release 7.2 renames timestamp_ops to timestamptz_ops, so suppress that
+	 * too for awhile.  I'm starting to think we need a better approach. tgl
+	 * 2000/10/01
+	 *
+	 * Release 8.0 removes bigbox_ops (which was dead code for a long while
+	 * anyway).  tgl 2003/11/11
+	 */
+	if (list_length(opclass) == 1)
+	{
+		char	   *claname = strVal(linitial(opclass));
+
+		if (strcmp(claname, "network_ops") == 0 ||
+			strcmp(claname, "timespan_ops") == 0 ||
+			strcmp(claname, "datetime_ops") == 0 ||
+			strcmp(claname, "lztext_ops") == 0 ||
+			strcmp(claname, "timestamp_ops") == 0 ||
+			strcmp(claname, "bigbox_ops") == 0)
+			opclass = NIL;
+	}
 
 	if (opclass == NIL)
 	{

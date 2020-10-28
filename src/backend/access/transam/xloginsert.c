@@ -9,7 +9,7 @@
  * of XLogRecData structs by a call to XLogRecordAssemble(). See
  * access/transam/README for details.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/xloginsert.c
@@ -25,13 +25,12 @@
 #include "access/xloginsert.h"
 #include "catalog/pg_control.h"
 #include "common/pg_lzcompress.h"
-#include "executor/instrument.h"
 #include "miscadmin.h"
-#include "pg_trace.h"
 #include "replication/origin.h"
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
 #include "utils/memutils.h"
+#include "pg_trace.h"
 
 /* Buffer size required to store a compressed version of backup block image */
 #define PGLZ_MAX_BLCKSZ PGLZ_MAX_OUTPUT(BLCKSZ)
@@ -109,7 +108,7 @@ static MemoryContext xloginsert_cxt;
 
 static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info,
 									   XLogRecPtr RedoRecPtr, bool doPageWrites,
-									   XLogRecPtr *fpw_lsn, int *num_fpi);
+									   XLogRecPtr *fpw_lsn);
 static bool XLogCompressBackupBlock(char *page, uint16 hole_offset,
 									uint16 hole_length, char *dest, uint16 *dlen);
 
@@ -449,7 +448,6 @@ XLogInsert(RmgrId rmid, uint8 info)
 		bool		doPageWrites;
 		XLogRecPtr	fpw_lsn;
 		XLogRecData *rdt;
-		int			num_fpi = 0;
 
 		/*
 		 * Get values needed to decide whether to do full-page writes. Since
@@ -459,9 +457,9 @@ XLogInsert(RmgrId rmid, uint8 info)
 		GetFullPageWriteInfo(&RedoRecPtr, &doPageWrites);
 
 		rdt = XLogRecordAssemble(rmid, info, RedoRecPtr, doPageWrites,
-								 &fpw_lsn, &num_fpi);
+								 &fpw_lsn);
 
-		EndPos = XLogInsertRecord(rdt, fpw_lsn, curinsert_flags, num_fpi);
+		EndPos = XLogInsertRecord(rdt, fpw_lsn, curinsert_flags);
 	} while (EndPos == InvalidXLogRecPtr);
 
 	XLogResetInsertion();
@@ -484,7 +482,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 static XLogRecData *
 XLogRecordAssemble(RmgrId rmid, uint8 info,
 				   XLogRecPtr RedoRecPtr, bool doPageWrites,
-				   XLogRecPtr *fpw_lsn, int *num_fpi)
+				   XLogRecPtr *fpw_lsn)
 {
 	XLogRecData *rdt;
 	uint32		total_len = 0;
@@ -636,9 +634,6 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 			 * struct
 			 */
 			bkpb.fork_flags |= BKPBLOCK_HAS_IMAGE;
-
-			/* Report a full page image constructed for the WAL record */
-			*num_fpi += 1;
 
 			/*
 			 * Construct XLogRecData entries for the page content.
@@ -904,7 +899,7 @@ XLogSaveBufferForHint(Buffer buffer, bool buffer_std)
 	/*
 	 * Ensure no checkpoint can change our view of RedoRecPtr.
 	 */
-	Assert(MyProc->delayChkpt);
+	Assert(MyPgXact->delayChkpt);
 
 	/*
 	 * Update RedoRecPtr so that we can make the right decision

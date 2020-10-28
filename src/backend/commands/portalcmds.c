@@ -9,7 +9,7 @@
  * storage management for portals (but doesn't run any queries in them).
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -39,15 +39,14 @@
  *		Execute SQL DECLARE CURSOR command.
  */
 void
-PerformCursorOpen(ParseState *pstate, DeclareCursorStmt *cstmt, ParamListInfo params,
-				  bool isTopLevel)
+PerformCursorOpen(DeclareCursorStmt *cstmt, ParamListInfo params,
+				  const char *queryString, bool isTopLevel)
 {
 	Query	   *query = castNode(Query, cstmt->query);
 	List	   *rewritten;
 	PlannedStmt *plan;
 	Portal		portal;
 	MemoryContext oldContext;
-	char	   *queryString;
 
 	/*
 	 * Disallow empty-string cursor name (conflicts with protocol-level
@@ -90,10 +89,10 @@ PerformCursorOpen(ParseState *pstate, DeclareCursorStmt *cstmt, ParamListInfo pa
 		elog(ERROR, "non-SELECT statement in DECLARE CURSOR");
 
 	/* Plan the query, applying the specified options */
-	plan = pg_plan_query(query, pstate->p_sourcetext, cstmt->options, params);
+	plan = pg_plan_query(query, cstmt->options, params);
 
 	/*
-	 * Create a portal and copy the plan and query string into its memory.
+	 * Create a portal and copy the plan and queryString into its memory.
 	 */
 	portal = CreatePortal(cstmt->portalname, false, false);
 
@@ -101,12 +100,12 @@ PerformCursorOpen(ParseState *pstate, DeclareCursorStmt *cstmt, ParamListInfo pa
 
 	plan = copyObject(plan);
 
-	queryString = pstrdup(pstate->p_sourcetext);
+	queryString = pstrdup(queryString);
 
 	PortalDefineQuery(portal,
 					  NULL,
 					  queryString,
-					  CMDTAG_SELECT,	/* cursor's query is always a SELECT */
+					  "SELECT", /* cursor's query is always a SELECT */
 					  list_make1(plan),
 					  NULL);
 
@@ -160,14 +159,15 @@ PerformCursorOpen(ParseState *pstate, DeclareCursorStmt *cstmt, ParamListInfo pa
  *
  *	stmt: parsetree node for command
  *	dest: where to send results
- *	qc: where to store a command completion status data.
+ *	completionTag: points to a buffer of size COMPLETION_TAG_BUFSIZE
+ *		in which to store a command completion status string.
  *
- * qc may be NULL if caller doesn't want status data.
+ * completionTag may be NULL if caller doesn't want a status string.
  */
 void
 PerformPortalFetch(FetchStmt *stmt,
 				   DestReceiver *dest,
-				   QueryCompletion *qc)
+				   char *completionTag)
 {
 	Portal		portal;
 	uint64		nprocessed;
@@ -202,9 +202,10 @@ PerformPortalFetch(FetchStmt *stmt,
 								dest);
 
 	/* Return command status if wanted */
-	if (qc)
-		SetQueryCompletion(qc, stmt->ismove ? CMDTAG_MOVE : CMDTAG_FETCH,
-						   nprocessed);
+	if (completionTag)
+		snprintf(completionTag, COMPLETION_TAG_BUFSIZE, "%s " UINT64_FORMAT,
+				 stmt->ismove ? "MOVE" : "FETCH",
+				 nprocessed);
 }
 
 /*

@@ -3,7 +3,7 @@
  * walsender_private.h
  *	  Private definitions from replication/walsender.c.
  *
- * Portions Copyright (c) 2010-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2019, PostgreSQL Global Development Group
  *
  * src/include/replication/walsender_private.h
  *
@@ -59,13 +59,7 @@ typedef struct WalSnd
 	TimeOffset	flushLag;
 	TimeOffset	applyLag;
 
-	/*
-	 * The priority order of the standby managed by this WALSender, as listed
-	 * in synchronous_standby_names, or 0 if not-listed.
-	 */
-	int			sync_standby_priority;
-
-	/* Protects shared variables shown above. */
+	/* Protects shared variables shown above (and sync_standby_priority). */
 	slock_t		mutex;
 
 	/*
@@ -75,14 +69,15 @@ typedef struct WalSnd
 	Latch	   *latch;
 
 	/*
+	 * The priority order of the standby managed by this WALSender, as listed
+	 * in synchronous_standby_names, or 0 if not-listed.
+	 */
+	int			sync_standby_priority;
+
+	/*
 	 * Timestamp of the last message received from standby.
 	 */
 	TimestampTz replyTime;
-
-	/* Statistics for transactions spilled to disk. */
-	int64		spillTxns;
-	int64		spillCount;
-	int64		spillBytes;
 } WalSnd;
 
 extern WalSnd *MyWalSnd;

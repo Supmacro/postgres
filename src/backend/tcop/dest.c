@@ -4,7 +4,7 @@
  *	  support for communication destinations
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -100,7 +100,7 @@ DestReceiver *None_Receiver = (DestReceiver *) &donothingDR;
  * ----------------
  */
 void
-BeginCommand(CommandTag commandTag, CommandDest dest)
+BeginCommand(const char *commandTag, CommandDest dest)
 {
 	/* Nothing to do at present */
 }
@@ -163,12 +163,8 @@ CreateDestReceiver(CommandDest dest)
  * ----------------
  */
 void
-EndCommand(const QueryCompletion *qc, CommandDest dest, bool force_undecorated_output)
+EndCommand(const char *commandTag, CommandDest dest)
 {
-	char		completionTag[COMPLETION_TAG_BUFSIZE];
-	CommandTag	tag;
-	const char *tagname;
-
 	switch (dest)
 	{
 		case DestRemote:
@@ -176,27 +172,11 @@ EndCommand(const QueryCompletion *qc, CommandDest dest, bool force_undecorated_o
 		case DestRemoteSimple:
 
 			/*
-			 * We assume the tagname is plain ASCII and therefore requires no
-			 * encoding conversion.
-			 *
-			 * We no longer display LastOid, but to preserve the wire
-			 * protocol, we write InvalidOid where the LastOid used to be
-			 * written.
-			 *
-			 * All cases where LastOid was written also write nprocessed
-			 * count, so just Assert that rather than having an extra test.
+			 * We assume the commandTag is plain ASCII and therefore requires
+			 * no encoding conversion.
 			 */
-			tag = qc->commandTag;
-			tagname = GetCommandTagName(tag);
-
-			if (command_tag_display_rowcount(tag) && !force_undecorated_output)
-				snprintf(completionTag, COMPLETION_TAG_BUFSIZE,
-						 tag == CMDTAG_INSERT ?
-						 "%s 0 " UINT64_FORMAT : "%s " UINT64_FORMAT,
-						 tagname, qc->nprocessed);
-			else
-				snprintf(completionTag, COMPLETION_TAG_BUFSIZE, "%s", tagname);
-			pq_putmessage('C', completionTag, strlen(completionTag) + 1);
+			pq_putmessage('C', commandTag, strlen(commandTag) + 1);
+			break;
 
 		case DestNone:
 		case DestDebug:

@@ -3,8 +3,6 @@
 # src/tools/msvc/pgflex.pl
 
 use strict;
-use warnings;
-
 use File::Basename;
 
 # silence flex bleatings about file path style

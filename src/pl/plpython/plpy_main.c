@@ -12,24 +12,28 @@
 #include "commands/trigger.h"
 #include "executor/spi.h"
 #include "miscadmin.h"
-#include "plpy_elog.h"
-#include "plpy_exec.h"
-#include "plpy_main.h"
-#include "plpy_plpymodule.h"
-#include "plpy_procedure.h"
-#include "plpy_subxactobject.h"
-#include "plpython.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+
+#include "plpython.h"
+
+#include "plpy_main.h"
+
+#include "plpy_elog.h"
+#include "plpy_exec.h"
+#include "plpy_plpymodule.h"
+#include "plpy_procedure.h"
+#include "plpy_subxactobject.h"
+
 
 /*
  * exported functions
  */
 
 #if PY_MAJOR_VERSION >= 3
-/* Use separate names to reduce confusion */
+/* Use separate names to avoid clash in pg_pltemplate */
 #define plpython_validator plpython3_validator
 #define plpython_call_handler plpython3_call_handler
 #define plpython_inline_handler plpython3_inline_handler
@@ -379,7 +383,9 @@ plpython2_inline_handler(PG_FUNCTION_ARGS)
 static bool
 PLy_procedure_is_trigger(Form_pg_proc procStruct)
 {
-	return (procStruct->prorettype == TRIGGEROID);
+	return (procStruct->prorettype == TRIGGEROID ||
+			(procStruct->prorettype == OPAQUEOID &&
+			 procStruct->pronargs == 0));
 }
 
 static void

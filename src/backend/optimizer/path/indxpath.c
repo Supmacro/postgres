@@ -4,7 +4,7 @@
  *	  Routines to determine which indexes are usable for scanning a
  *	  given relation, and create Paths accordingly.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -122,7 +122,6 @@ static Cost bitmap_and_cost_est(PlannerInfo *root, RelOptInfo *rel,
 								List *paths);
 static PathClauseUsage *classify_index_clause_usage(Path *path,
 													List **clauselist);
-static Relids get_bitmap_tree_required_outer(Path *bitmapqual);
 static void find_indexpath_quals(Path *bitmapqual, List **quals, List **preds);
 static int	find_list_position(Node *node, List **nodelist);
 static bool check_index_only(RelOptInfo *rel, IndexOptInfo *index);
@@ -357,23 +356,16 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 	 */
 	if (bitjoinpaths != NIL)
 	{
-		List	   *path_outer;
 		List	   *all_path_outers;
 		ListCell   *lc;
 
-		/*
-		 * path_outer holds the parameterization of each path in bitjoinpaths
-		 * (to save recalculating that several times), while all_path_outers
-		 * holds all distinct parameterization sets.
-		 */
-		path_outer = all_path_outers = NIL;
+		/* Identify each distinct parameterization seen in bitjoinpaths */
+		all_path_outers = NIL;
 		foreach(lc, bitjoinpaths)
 		{
 			Path	   *path = (Path *) lfirst(lc);
-			Relids		required_outer;
+			Relids		required_outer = PATH_REQ_OUTER(path);
 
-			required_outer = get_bitmap_tree_required_outer(path);
-			path_outer = lappend(path_outer, required_outer);
 			if (!bms_equal_any(required_outer, all_path_outers))
 				all_path_outers = lappend(all_path_outers, required_outer);
 		}
@@ -388,16 +380,14 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 			double		loop_count;
 			BitmapHeapPath *bpath;
 			ListCell   *lcp;
-			ListCell   *lco;
 
 			/* Identify all the bitmap join paths needing no more than that */
 			this_path_set = NIL;
-			forboth(lcp, bitjoinpaths, lco, path_outer)
+			foreach(lcp, bitjoinpaths)
 			{
 				Path	   *path = (Path *) lfirst(lcp);
-				Relids		p_outers = (Relids) lfirst(lco);
 
-				if (bms_is_subset(p_outers, max_outers))
+				if (bms_is_subset(PATH_REQ_OUTER(path), max_outers))
 					this_path_set = lappend(this_path_set, path);
 			}
 
@@ -411,7 +401,7 @@ create_index_paths(PlannerInfo *root, RelOptInfo *rel)
 			bitmapqual = choose_bitmap_and(root, rel, this_path_set);
 
 			/* And push that path into the mix */
-			required_outer = get_bitmap_tree_required_outer(bitmapqual);
+			required_outer = PATH_REQ_OUTER(bitmapqual);
 			loop_count = get_loop_count(root, rel->relid, required_outer);
 			bpath = create_bitmap_heap_path(root, rel, bitmapqual,
 											required_outer, loop_count, 0);
@@ -520,7 +510,7 @@ consider_index_join_outer_rels(PlannerInfo *root, RelOptInfo *rel,
 		IndexClause *iclause = (IndexClause *) lfirst(lc);
 		Relids		clause_relids = iclause->rinfo->clause_relids;
 		EquivalenceClass *parent_ec = iclause->rinfo->parent_ec;
-		int			num_considered_relids;
+		ListCell   *lc2;
 
 		/* If we already tried its relids set, no need to do so again */
 		if (bms_equal_any(clause_relids, *considered_relids))
@@ -533,16 +523,15 @@ consider_index_join_outer_rels(PlannerInfo *root, RelOptInfo *rel,
 		 * exponential growth of planning time when there are many clauses,
 		 * limit the number of relid sets accepted to 10 * considered_clauses.
 		 *
-		 * Note: get_join_index_paths appends entries to *considered_relids,
-		 * but we do not need to visit such newly-added entries within this
-		 * loop, so we don't use foreach() here.  No real harm would be done
-		 * if we did visit them, since the subset check would reject them; but
-		 * it would waste some cycles.
+		 * Note: get_join_index_paths adds entries to *considered_relids, but
+		 * it prepends them to the list, so that we won't visit new entries
+		 * during the inner foreach loop.  No real harm would be done if we
+		 * did, since the subset check would reject them; but it would waste
+		 * some cycles.
 		 */
-		num_considered_relids = list_length(*considered_relids);
-		for (int pos = 0; pos < num_considered_relids; pos++)
+		foreach(lc2, *considered_relids)
 		{
-			Relids		oldrelids = (Relids) list_nth(*considered_relids, pos);
+			Relids		oldrelids = (Relids) lfirst(lc2);
 
 			/*
 			 * If either is a subset of the other, no new set is possible.
@@ -656,7 +645,7 @@ get_join_index_paths(PlannerInfo *root, RelOptInfo *rel,
 			}
 		}
 
-		/* Add restriction clauses */
+		/* Add restriction clauses (this is nondestructive to rclauseset) */
 		clauseset.indexclauses[indexcol] =
 			list_concat(clauseset.indexclauses[indexcol],
 						rclauseset->indexclauses[indexcol]);
@@ -672,9 +661,10 @@ get_join_index_paths(PlannerInfo *root, RelOptInfo *rel,
 	get_index_paths(root, rel, index, &clauseset, bitindexpaths);
 
 	/*
-	 * Remember we considered paths for this set of relids.
+	 * Remember we considered paths for this set of relids.  We use lcons not
+	 * lappend to avoid confusing the loop in consider_index_join_outer_rels.
 	 */
-	*considered_relids = lappend(*considered_relids, relids);
+	*considered_relids = lcons(relids, *considered_relids);
 }
 
 /*
@@ -1204,7 +1194,8 @@ build_paths_for_OR(PlannerInfo *root, RelOptInfo *rel,
 			{
 				/* Form all_clauses if not done already */
 				if (all_clauses == NIL)
-					all_clauses = list_concat_copy(clauses, other_clauses);
+					all_clauses = list_concat(list_copy(clauses),
+											  other_clauses);
 
 				if (!predicate_implied_by(index->indpred, all_clauses, false))
 					continue;	/* can't use it at all */
@@ -1269,7 +1260,7 @@ generate_bitmap_or_paths(PlannerInfo *root, RelOptInfo *rel,
 	 * We can use both the current and other clauses as context for
 	 * build_paths_for_OR; no need to remove ORs from the lists.
 	 */
-	all_clauses = list_concat_copy(clauses, other_clauses);
+	all_clauses = list_concat(list_copy(clauses), other_clauses);
 
 	foreach(lc, clauses)
 	{
@@ -1501,12 +1492,15 @@ choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel, List *paths)
 		Cost		costsofar;
 		List	   *qualsofar;
 		Bitmapset  *clauseidsofar;
+		ListCell   *lastcell;
 
 		pathinfo = pathinfoarray[i];
 		paths = list_make1(pathinfo->path);
 		costsofar = bitmap_scan_cost_est(root, rel, pathinfo->path);
-		qualsofar = list_concat_copy(pathinfo->quals, pathinfo->preds);
+		qualsofar = list_concat(list_copy(pathinfo->quals),
+								list_copy(pathinfo->preds));
 		clauseidsofar = bms_copy(pathinfo->clauseids);
+		lastcell = list_head(paths);	/* for quick deletions */
 
 		for (j = i + 1; j < npaths; j++)
 		{
@@ -1541,16 +1535,20 @@ choose_bitmap_and(PlannerInfo *root, RelOptInfo *rel, List *paths)
 			{
 				/* keep new path in paths, update subsidiary variables */
 				costsofar = newcost;
-				qualsofar = list_concat(qualsofar, pathinfo->quals);
-				qualsofar = list_concat(qualsofar, pathinfo->preds);
+				qualsofar = list_concat(qualsofar,
+										list_copy(pathinfo->quals));
+				qualsofar = list_concat(qualsofar,
+										list_copy(pathinfo->preds));
 				clauseidsofar = bms_add_members(clauseidsofar,
 												pathinfo->clauseids);
+				lastcell = lnext(lastcell);
 			}
 			else
 			{
 				/* reject new path, remove it from paths list */
-				paths = list_truncate(paths, list_length(paths) - 1);
+				paths = list_delete_cell(paths, lnext(lastcell), lastcell);
 			}
+			Assert(lnext(lastcell) == NULL);
 		}
 
 		/* Keep the cheapest AND-group (or singleton) */
@@ -1601,25 +1599,19 @@ path_usage_comparator(const void *a, const void *b)
 
 /*
  * Estimate the cost of actually executing a bitmap scan with a single
- * index path (no BitmapAnd, at least not at this level; but it could be
- * a BitmapOr).
+ * index path (which could be a BitmapAnd or BitmapOr node).
  */
 static Cost
 bitmap_scan_cost_est(PlannerInfo *root, RelOptInfo *rel, Path *ipath)
 {
 	BitmapHeapPath bpath;
-	Relids		required_outer;
-
-	/* Identify required outer rels, in case it's a parameterized scan */
-	required_outer = get_bitmap_tree_required_outer(ipath);
 
 	/* Set up a dummy BitmapHeapPath */
 	bpath.path.type = T_BitmapHeapPath;
 	bpath.path.pathtype = T_BitmapHeapScan;
 	bpath.path.parent = rel;
 	bpath.path.pathtarget = rel->reltarget;
-	bpath.path.param_info = get_baserel_parampathinfo(root, rel,
-													  required_outer);
+	bpath.path.param_info = ipath->param_info;
 	bpath.path.pathkeys = NIL;
 	bpath.bitmapqual = ipath;
 
@@ -1628,10 +1620,13 @@ bitmap_scan_cost_est(PlannerInfo *root, RelOptInfo *rel, Path *ipath)
 	 * Parallel bitmap heap path will be considered at later stage.
 	 */
 	bpath.path.parallel_workers = 0;
+
+	/* Now we can do cost_bitmap_heap_scan */
 	cost_bitmap_heap_scan(&bpath.path, root, rel,
 						  bpath.path.param_info,
 						  ipath,
-						  get_loop_count(root, rel->relid, required_outer));
+						  get_loop_count(root, rel->relid,
+										 PATH_REQ_OUTER(ipath)));
 
 	return bpath.path.total_cost;
 }
@@ -1643,46 +1638,15 @@ bitmap_scan_cost_est(PlannerInfo *root, RelOptInfo *rel, Path *ipath)
 static Cost
 bitmap_and_cost_est(PlannerInfo *root, RelOptInfo *rel, List *paths)
 {
-	BitmapAndPath apath;
-	BitmapHeapPath bpath;
-	Relids		required_outer;
-
-	/* Set up a dummy BitmapAndPath */
-	apath.path.type = T_BitmapAndPath;
-	apath.path.pathtype = T_BitmapAnd;
-	apath.path.parent = rel;
-	apath.path.pathtarget = rel->reltarget;
-	apath.path.param_info = NULL;	/* not used in bitmap trees */
-	apath.path.pathkeys = NIL;
-	apath.bitmapquals = paths;
-	cost_bitmap_and_node(&apath, root);
-
-	/* Identify required outer rels, in case it's a parameterized scan */
-	required_outer = get_bitmap_tree_required_outer((Path *) &apath);
-
-	/* Set up a dummy BitmapHeapPath */
-	bpath.path.type = T_BitmapHeapPath;
-	bpath.path.pathtype = T_BitmapHeapScan;
-	bpath.path.parent = rel;
-	bpath.path.pathtarget = rel->reltarget;
-	bpath.path.param_info = get_baserel_parampathinfo(root, rel,
-													  required_outer);
-	bpath.path.pathkeys = NIL;
-	bpath.bitmapqual = (Path *) &apath;
+	BitmapAndPath *apath;
 
 	/*
-	 * Check the cost of temporary path without considering parallelism.
-	 * Parallel bitmap heap path will be considered at later stage.
+	 * Might as well build a real BitmapAndPath here, as the work is slightly
+	 * too complicated to be worth repeating just to save one palloc.
 	 */
-	bpath.path.parallel_workers = 0;
+	apath = create_bitmap_and_path(root, rel, paths);
 
-	/* Now we can do cost_bitmap_heap_scan */
-	cost_bitmap_heap_scan(&bpath.path, root, rel,
-						  bpath.path.param_info,
-						  (Path *) &apath,
-						  get_loop_count(root, rel->relid, required_outer));
-
-	return bpath.path.total_cost;
+	return bitmap_scan_cost_est(root, rel, (Path *) apath);
 }
 
 
@@ -1754,49 +1718,6 @@ classify_index_clause_usage(Path *path, List **clauselist)
 
 
 /*
- * get_bitmap_tree_required_outer
- *		Find the required outer rels for a bitmap tree (index/and/or)
- *
- * We don't associate any particular parameterization with a BitmapAnd or
- * BitmapOr node; however, the IndexPaths have parameterization info, in
- * their capacity as standalone access paths.  The parameterization required
- * for the bitmap heap scan node is the union of rels referenced in the
- * child IndexPaths.
- */
-static Relids
-get_bitmap_tree_required_outer(Path *bitmapqual)
-{
-	Relids		result = NULL;
-	ListCell   *lc;
-
-	if (IsA(bitmapqual, IndexPath))
-	{
-		return bms_copy(PATH_REQ_OUTER(bitmapqual));
-	}
-	else if (IsA(bitmapqual, BitmapAndPath))
-	{
-		foreach(lc, ((BitmapAndPath *) bitmapqual)->bitmapquals)
-		{
-			result = bms_join(result,
-							  get_bitmap_tree_required_outer((Path *) lfirst(lc)));
-		}
-	}
-	else if (IsA(bitmapqual, BitmapOrPath))
-	{
-		foreach(lc, ((BitmapOrPath *) bitmapqual)->bitmapquals)
-		{
-			result = bms_join(result,
-							  get_bitmap_tree_required_outer((Path *) lfirst(lc)));
-		}
-	}
-	else
-		elog(ERROR, "unrecognized node type: %d", nodeTag(bitmapqual));
-
-	return result;
-}
-
-
-/*
  * find_indexpath_quals
  *
  * Given the Path structure for a plain or bitmap indexscan, extract lists
@@ -1845,7 +1766,7 @@ find_indexpath_quals(Path *bitmapqual, List **quals, List **preds)
 
 			*quals = lappend(*quals, iclause->rinfo->clause);
 		}
-		*preds = list_concat(*preds, ipath->indexinfo->indpred);
+		*preds = list_concat(*preds, list_copy(ipath->indexinfo->indpred));
 	}
 	else
 		elog(ERROR, "unrecognized node type: %d", nodeTag(bitmapqual));
@@ -2962,6 +2883,10 @@ expand_indexqual_rowcompare(RestrictInfo *rinfo,
 	List	   *new_ops;
 	List	   *var_args;
 	List	   *non_var_args;
+	ListCell   *vargs_cell;
+	ListCell   *nargs_cell;
+	ListCell   *opnos_cell;
+	ListCell   *collids_cell;
 
 	iclause->rinfo = rinfo;
 	iclause->indexcol = indexcol;
@@ -2998,14 +2923,18 @@ expand_indexqual_rowcompare(RestrictInfo *rinfo,
 	 * indexed relation.
 	 */
 	matching_cols = 1;
+	vargs_cell = lnext(list_head(var_args));
+	nargs_cell = lnext(list_head(non_var_args));
+	opnos_cell = lnext(list_head(clause->opnos));
+	collids_cell = lnext(list_head(clause->inputcollids));
 
-	while (matching_cols < list_length(var_args))
+	while (vargs_cell != NULL)
 	{
-		Node	   *varop = (Node *) list_nth(var_args, matching_cols);
-		Node	   *constop = (Node *) list_nth(non_var_args, matching_cols);
+		Node	   *varop = (Node *) lfirst(vargs_cell);
+		Node	   *constop = (Node *) lfirst(nargs_cell);
 		int			i;
 
-		expr_op = list_nth_oid(clause->opnos, matching_cols);
+		expr_op = lfirst_oid(opnos_cell);
 		if (!var_on_left)
 		{
 			/* indexkey is on right, so commute the operator */
@@ -3027,8 +2956,7 @@ expand_indexqual_rowcompare(RestrictInfo *rinfo,
 				get_op_opfamily_strategy(expr_op,
 										 index->opfamily[i]) == op_strategy &&
 				IndexCollMatchesExprColl(index->indexcollations[i],
-										 list_nth_oid(clause->inputcollids,
-													  matching_cols)))
+										 lfirst_oid(collids_cell)))
 				break;
 		}
 		if (i >= index->nkeycolumns)
@@ -3049,6 +2977,10 @@ expand_indexqual_rowcompare(RestrictInfo *rinfo,
 
 		/* This column matches, keep scanning */
 		matching_cols++;
+		vargs_cell = lnext(vargs_cell);
+		nargs_cell = lnext(nargs_cell);
+		opnos_cell = lnext(opnos_cell);
+		collids_cell = lnext(collids_cell);
 	}
 
 	/* Result is non-lossy if all columns are usable as index quals */
@@ -3847,7 +3779,7 @@ match_index_to_operand(Node *operand,
 			{
 				if (indexpr_item == NULL)
 					elog(ERROR, "wrong number of index expressions");
-				indexpr_item = lnext(index->indexprs, indexpr_item);
+				indexpr_item = lnext(indexpr_item);
 			}
 		}
 		if (indexpr_item == NULL)

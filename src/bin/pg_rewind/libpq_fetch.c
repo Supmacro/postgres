@@ -3,7 +3,7 @@
  * libpq_fetch.c
  *	  Functions for fetching files from a remote server.
  *
- * Copyright (c) 2013-2020, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2019, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -14,16 +14,18 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include "catalog/pg_type_d.h"
+#include "pg_rewind.h"
 #include "datapagemap.h"
-#include "fe_utils/connect.h"
 #include "fetch.h"
 #include "file_ops.h"
 #include "filemap.h"
-#include "pg_rewind.h"
+
+#include "libpq-fe.h"
+#include "catalog/pg_type_d.h"
+#include "fe_utils/connect.h"
 #include "port/pg_bswap.h"
 
-PGconn	   *conn = NULL;
+static PGconn *conn = NULL;
 
 /*
  * Files are fetched max CHUNKSIZE bytes at a time.
@@ -108,7 +110,7 @@ run_simple_query(const char *sql)
 	res = PQexec(conn, sql);
 
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-		pg_fatal("error running query (%s) on source server: %s",
+		pg_fatal("error running query (%s) in source server: %s",
 				 sql, PQresultErrorMessage(res));
 
 	/* sanity check the result set */
@@ -214,13 +216,13 @@ libpqProcessFileList(void)
 	/* Read result to local variables */
 	for (i = 0; i < PQntuples(res); i++)
 	{
-		char	   *path = PQgetvalue(res, i, 0);
-		int64		filesize = atol(PQgetvalue(res, i, 1));
-		bool		isdir = (strcmp(PQgetvalue(res, i, 2), "t") == 0);
-		char	   *link_target = PQgetvalue(res, i, 3);
+		char	   *path;
+		int64		filesize;
+		bool		isdir;
+		char	   *link_target;
 		file_type_t type;
 
-		if (PQgetisnull(res, 0, 1))
+		if (PQgetisnull(res, i, 1))
 		{
 			/*
 			 * The file was removed from the server while the query was
@@ -228,6 +230,11 @@ libpqProcessFileList(void)
 			 */
 			continue;
 		}
+
+		path = PQgetvalue(res, i, 0);
+		filesize = atol(PQgetvalue(res, i, 1));
+		isdir = (strcmp(PQgetvalue(res, i, 2), "t") == 0);
+		link_target = PQgetvalue(res, i, 3);
 
 		if (link_target[0])
 			type = FILE_TYPE_SYMLINK;
@@ -269,6 +276,7 @@ receiveFileChunks(const char *sql)
 		char	   *filename;
 		int			filenamelen;
 		int64		chunkoff;
+		char		chunkoff_str[32];
 		int			chunksize;
 		char	   *chunk;
 
@@ -344,8 +352,13 @@ receiveFileChunks(const char *sql)
 			continue;
 		}
 
-		pg_log_debug("received chunk for file \"%s\", offset %lld, size %d",
-					 filename, (long long int) chunkoff, chunksize);
+		/*
+		 * Separate step to keep platform-dependent format code out of
+		 * translatable strings.
+		 */
+		snprintf(chunkoff_str, sizeof(chunkoff_str), INT64_FORMAT, chunkoff);
+		pg_log_debug("received chunk for file \"%s\", offset %s, size %d",
+					 filename, chunkoff_str, chunksize);
 
 		open_target_file(filename, false);
 

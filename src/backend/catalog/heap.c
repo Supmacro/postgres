@@ -3,7 +3,7 @@
  * heap.c
  *	  code to create and destroy POSTGRES heap relations
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -83,6 +83,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/partcache.h"
+#include "utils/rel.h"
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -124,6 +125,7 @@ static void SetRelationNumChecks(Relation rel, int numchecks);
 static Node *cookConstraint(ParseState *pstate,
 							Node *raw_constraint,
 							char *relname);
+static List *insert_ordered_unique_oid(List *list, Oid datum);
 
 
 /* ----------------------------------------------------------------
@@ -156,8 +158,8 @@ static const FormData_pg_attribute a1 = {
 	.attcacheoff = -1,
 	.atttypmod = -1,
 	.attbyval = false,
-	.attstorage = TYPSTORAGE_PLAIN,
-	.attalign = TYPALIGN_SHORT,
+	.attstorage = 'p',
+	.attalign = 's',
 	.attnotnull = true,
 	.attislocal = true,
 };
@@ -170,8 +172,8 @@ static const FormData_pg_attribute a2 = {
 	.attcacheoff = -1,
 	.atttypmod = -1,
 	.attbyval = true,
-	.attstorage = TYPSTORAGE_PLAIN,
-	.attalign = TYPALIGN_INT,
+	.attstorage = 'p',
+	.attalign = 'i',
 	.attnotnull = true,
 	.attislocal = true,
 };
@@ -184,8 +186,8 @@ static const FormData_pg_attribute a3 = {
 	.attcacheoff = -1,
 	.atttypmod = -1,
 	.attbyval = true,
-	.attstorage = TYPSTORAGE_PLAIN,
-	.attalign = TYPALIGN_INT,
+	.attstorage = 'p',
+	.attalign = 'i',
 	.attnotnull = true,
 	.attislocal = true,
 };
@@ -198,8 +200,8 @@ static const FormData_pg_attribute a4 = {
 	.attcacheoff = -1,
 	.atttypmod = -1,
 	.attbyval = true,
-	.attstorage = TYPSTORAGE_PLAIN,
-	.attalign = TYPALIGN_INT,
+	.attstorage = 'p',
+	.attalign = 'i',
 	.attnotnull = true,
 	.attislocal = true,
 };
@@ -212,8 +214,8 @@ static const FormData_pg_attribute a5 = {
 	.attcacheoff = -1,
 	.atttypmod = -1,
 	.attbyval = true,
-	.attstorage = TYPSTORAGE_PLAIN,
-	.attalign = TYPALIGN_INT,
+	.attstorage = 'p',
+	.attalign = 'i',
 	.attnotnull = true,
 	.attislocal = true,
 };
@@ -232,8 +234,8 @@ static const FormData_pg_attribute a6 = {
 	.attcacheoff = -1,
 	.atttypmod = -1,
 	.attbyval = true,
-	.attstorage = TYPSTORAGE_PLAIN,
-	.attalign = TYPALIGN_INT,
+	.attstorage = 'p',
+	.attalign = 'i',
 	.attnotnull = true,
 	.attislocal = true,
 };
@@ -645,7 +647,7 @@ CheckAttributeType(const char *attname,
 					 errmsg("composite type %s cannot be made a member of itself",
 							format_type_be(atttypid))));
 
-		containing_rowtypes = lappend_oid(containing_rowtypes, atttypid);
+		containing_rowtypes = lcons_oid(atttypid, containing_rowtypes);
 
 		relation = relation_open(get_typ_typrelid(atttypid), AccessShareLock);
 
@@ -665,7 +667,7 @@ CheckAttributeType(const char *attname,
 
 		relation_close(relation, AccessShareLock);
 
-		containing_rowtypes = list_delete_last(containing_rowtypes);
+		containing_rowtypes = list_delete_first(containing_rowtypes);
 	}
 	else if (att_typtype == TYPTYPE_RANGE)
 	{
@@ -725,7 +727,6 @@ CheckAttributeType(const char *attname,
 void
 InsertPgAttributeTuple(Relation pg_attribute_rel,
 					   Form_pg_attribute new_attribute,
-					   Datum attoptions,
 					   CatalogIndexState indstate)
 {
 	Datum		values[Natts_pg_attribute];
@@ -757,11 +758,10 @@ InsertPgAttributeTuple(Relation pg_attribute_rel,
 	values[Anum_pg_attribute_attislocal - 1] = BoolGetDatum(new_attribute->attislocal);
 	values[Anum_pg_attribute_attinhcount - 1] = Int32GetDatum(new_attribute->attinhcount);
 	values[Anum_pg_attribute_attcollation - 1] = ObjectIdGetDatum(new_attribute->attcollation);
-	values[Anum_pg_attribute_attoptions - 1] = attoptions;
 
 	/* start out with empty permissions and empty options */
 	nulls[Anum_pg_attribute_attacl - 1] = true;
-	nulls[Anum_pg_attribute_attoptions - 1] = attoptions == (Datum) 0;
+	nulls[Anum_pg_attribute_attoptions - 1] = true;
 	nulls[Anum_pg_attribute_attfdwoptions - 1] = true;
 	nulls[Anum_pg_attribute_attmissingval - 1] = true;
 
@@ -815,7 +815,7 @@ AddNewAttributeTuples(Oid new_rel_oid,
 		/* Make sure this is OK, too */
 		attr->attstattarget = -1;
 
-		InsertPgAttributeTuple(rel, attr, (Datum) 0, indstate);
+		InsertPgAttributeTuple(rel, attr, indstate);
 
 		/* Add dependency info */
 		myself.classId = RelationRelationId;
@@ -853,7 +853,7 @@ AddNewAttributeTuples(Oid new_rel_oid,
 			/* Fill in the correct relation OID in the copied tuple */
 			attStruct.attrelid = new_rel_oid;
 
-			InsertPgAttributeTuple(rel, &attStruct, (Datum) 0, indstate);
+			InsertPgAttributeTuple(rel, &attStruct, indstate);
 		}
 	}
 
@@ -1055,8 +1055,8 @@ AddNewRelationType(const char *typeName,
 				   NULL,		/* default value - none */
 				   NULL,		/* default binary representation */
 				   false,		/* passed by reference */
-				   TYPALIGN_DOUBLE, /* alignment - must be the largest! */
-				   TYPSTORAGE_EXTENDED, /* fully TOASTable */
+				   'd',			/* alignment - must be the largest! */
+				   'x',			/* fully TOASTable */
 				   -1,			/* typmod */
 				   0,			/* array dimensions for typBaseType */
 				   false,		/* Type NOT NULL */
@@ -1336,8 +1336,8 @@ heap_create_with_catalog(const char *relname,
 				   NULL,		/* default value - none */
 				   NULL,		/* default binary representation */
 				   false,		/* passed by reference */
-				   TYPALIGN_DOUBLE, /* alignment - must be the largest! */
-				   TYPSTORAGE_EXTENDED, /* fully TOASTable */
+				   'd',			/* alignment - must be the largest! */
+				   'x',			/* fully TOASTable */
 				   -1,			/* typmod */
 				   0,			/* array dimensions for typBaseType */
 				   false,		/* Type NOT NULL */
@@ -2259,7 +2259,8 @@ StoreAttrDefault(Relation rel, AttrNumber attnum,
 			else
 			{
 				/* otherwise make a one-element array of the value */
-				missingval = PointerGetDatum(construct_array(&missingval,
+				missingval = PointerGetDatum(
+											 construct_array(&missingval,
 															 1,
 															 defAttStruct->atttypid,
 															 defAttStruct->attlen,
@@ -2533,7 +2534,7 @@ AddRelationNewConstraints(Relation rel,
 	TupleConstr *oldconstr;
 	int			numoldchecks;
 	ParseState *pstate;
-	ParseNamespaceItem *nsitem;
+	RangeTblEntry *rte;
 	int			numchecks;
 	List	   *checknames;
 	ListCell   *cell;
@@ -2556,13 +2557,13 @@ AddRelationNewConstraints(Relation rel,
 	 */
 	pstate = make_parsestate(NULL);
 	pstate->p_sourcetext = queryString;
-	nsitem = addRangeTableEntryForRelation(pstate,
-										   rel,
-										   AccessShareLock,
-										   NULL,
-										   false,
-										   true);
-	addNSItemToQuery(pstate, nsitem, true, true, true);
+	rte = addRangeTableEntryForRelation(pstate,
+										rel,
+										AccessShareLock,
+										NULL,
+										false,
+										true);
+	addRTEtoQuery(pstate, rte, true, true, true);
 
 	/*
 	 * Process column default expressions.
@@ -3446,11 +3447,11 @@ restart:
 			parent_cons = lappend_oid(parent_cons, con->conparentid);
 
 		/*
-		 * Add referencer to result, unless present in input list.  (Don't
-		 * worry about dupes: we'll fix that below).
+		 * Add referencer to result, unless already present in input or result
+		 * list.
 		 */
 		if (!list_member_oid(relationIds, con->conrelid))
-			result = lappend_oid(result, con->conrelid);
+			result = insert_ordered_unique_oid(result, con->conrelid);
 	}
 
 	systable_endscan(fkeyScan);
@@ -3464,7 +3465,7 @@ restart:
 	 */
 	foreach(cell, parent_cons)
 	{
-		Oid			parent = lfirst_oid(cell);
+		Oid		parent = lfirst_oid(cell);
 
 		ScanKeyInit(&key,
 					Anum_pg_constraint_oid,
@@ -3487,9 +3488,9 @@ restart:
 			 *
 			 * Because of this arrangement, we can correctly catch all
 			 * relevant relations by adding to 'parent_cons' all rows with
-			 * valid conparentid, and to the 'oids' list all rows with a zero
-			 * conparentid.  If any oids are added to 'oids', redo the first
-			 * loop above by setting 'restart'.
+			 * valid conparentid, and to the 'oids' list all rows with a
+			 * zero conparentid.  If any oids are added to 'oids', redo the
+			 * first loop above by setting 'restart'.
 			 */
 			if (OidIsValid(con->conparentid))
 				parent_cons = list_append_unique_oid(parent_cons,
@@ -3511,11 +3512,47 @@ restart:
 	table_close(fkeyRel, AccessShareLock);
 	list_free(oids);
 
-	/* Now sort and de-duplicate the result list */
-	list_sort(result, list_oid_cmp);
-	list_deduplicate_oid(result);
-
 	return result;
+}
+
+/*
+ * insert_ordered_unique_oid
+ *		Insert a new Oid into a sorted list of Oids, preserving ordering,
+ *		and eliminating duplicates
+ *
+ * Building the ordered list this way is O(N^2), but with a pretty small
+ * constant, so for the number of entries we expect it will probably be
+ * faster than trying to apply qsort().  It seems unlikely someone would be
+ * trying to truncate a table with thousands of dependent tables ...
+ */
+static List *
+insert_ordered_unique_oid(List *list, Oid datum)
+{
+	ListCell   *prev;
+
+	/* Does the datum belong at the front? */
+	if (list == NIL || datum < linitial_oid(list))
+		return lcons_oid(datum, list);
+	/* Does it match the first entry? */
+	if (datum == linitial_oid(list))
+		return list;			/* duplicate, so don't insert */
+	/* No, so find the entry it belongs after */
+	prev = list_head(list);
+	for (;;)
+	{
+		ListCell   *curr = lnext(prev);
+
+		if (curr == NULL || datum < lfirst_oid(curr))
+			break;				/* it belongs after 'prev', before 'curr' */
+
+		if (datum == lfirst_oid(curr))
+			return list;		/* duplicate, so don't insert */
+
+		prev = curr;
+	}
+	/* Insert datum into list after 'prev' */
+	lappend_cell_oid(list, prev, datum);
+	return list;
 }
 
 /*

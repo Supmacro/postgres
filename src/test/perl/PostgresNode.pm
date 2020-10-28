@@ -116,7 +116,7 @@ INIT
 
 	# Set PGHOST for backward compatibility.  This doesn't work for own_host
 	# nodes, so prefer to not rely on this when writing new tests.
-	$use_tcp            = !$TestLib::use_unix_sockets;
+	$use_tcp            = $TestLib::windows_os;
 	$test_localhost     = "127.0.0.1";
 	$last_host_assigned = 1;
 	$test_pghost        = $use_tcp ? $test_localhost : TestLib::tempdir_short;
@@ -387,7 +387,7 @@ sub set_replication_conf
 
 	open my $hba, '>>', "$pgdata/pg_hba.conf";
 	print $hba "\n# Allow replication (set up by PostgresNode.pm)\n";
-	if ($TestLib::windows_os && !$TestLib::use_unix_sockets)
+	if ($TestLib::windows_os)
 	{
 		print $hba
 		  "host replication all $test_localhost/32 sspi include_realm=1 map=regress\n";
@@ -653,9 +653,6 @@ Restoring WAL segments from archives using restore_command can be enabled
 by passing the keyword parameter has_restoring => 1. This is disabled by
 default.
 
-If has_restoring is used, standby mode is used by default.  To use
-recovery mode instead, pass the keyword parameter standby => 0.
-
 The backup is copied, leaving the original unmodified. pg_hba.conf is
 unconditionally set to enable replication connections.
 
@@ -672,7 +669,6 @@ sub init_from_backup
 
 	$params{has_streaming} = 0 unless defined $params{has_streaming};
 	$params{has_restoring} = 0 unless defined $params{has_restoring};
-	$params{standby}       = 1 unless defined $params{standby};
 
 	print
 	  "# Initializing node \"$node_name\" from backup \"$backup_name\" of node \"$root_name\"\n";
@@ -703,8 +699,7 @@ port = $port
 			"unix_socket_directories = '$host'");
 	}
 	$self->enable_streaming($root_node) if $params{has_streaming};
-	$self->enable_restoring($root_node, $params{standby})
-	  if $params{has_restoring};
+	$self->enable_restoring($root_node) if $params{has_restoring};
 	return;
 }
 
@@ -944,7 +939,7 @@ primary_conninfo='$root_connstr'
 # Internal routine to enable archive recovery command on a standby node
 sub enable_restoring
 {
-	my ($self, $root_node, $standby) = @_;
+	my ($self, $root_node) = @_;
 	my $path = TestLib::perl2host($root_node->archive_dir);
 	my $name = $self->name;
 
@@ -966,30 +961,7 @@ sub enable_restoring
 		'postgresql.conf', qq(
 restore_command = '$copy_command'
 ));
-	if ($standby)
-	{
-		$self->set_standby_mode();
-	}
-	else
-	{
-		$self->set_recovery_mode();
-	}
-	return;
-}
-
-=pod
-
-=item $node->set_recovery_mode()
-
-Place recovery.signal file.
-
-=cut
-
-sub set_recovery_mode
-{
-	my ($self) = @_;
-
-	$self->append_conf('recovery.signal', '');
+	$self->set_standby_mode();
 	return;
 }
 
@@ -1324,7 +1296,6 @@ sub safe_psql
 		print "\n#### End standard error\n";
 	}
 
-	$stdout =~ s/\r//g if $TestLib::windows_os;
 	return $stdout;
 }
 
@@ -1386,12 +1357,6 @@ the B<timed_out> parameter is also given.
 If B<timeout> is set and this parameter is given, the scalar it references
 is set to true if the psql call times out.
 
-=item replication => B<value>
-
-If set, add B<replication=value> to the conninfo string.
-Passing the literal value C<database> results in a logical replication
-connection.
-
 =item extra_params => ['--single-transaction']
 
 If given, it must be an array reference containing additional parameters to B<psql>.
@@ -1420,17 +1385,10 @@ sub psql
 
 	my $stdout            = $params{stdout};
 	my $stderr            = $params{stderr};
-	my $replication       = $params{replication};
 	my $timeout           = undef;
 	my $timeout_exception = 'psql timed out';
-	my @psql_params       = (
-		'psql',
-		'-XAtq',
-		'-d',
-		$self->connstr($dbname)
-		  . (defined $replication ? " replication=$replication" : ""),
-		'-f',
-		'-');
+	my @psql_params =
+	  ('psql', '-XAtq', '-d', $self->connstr($dbname), '-f', '-');
 
 	# If the caller wants an array and hasn't passed stdout/stderr
 	# references, allocate temporary ones to capture them so we
@@ -1513,16 +1471,20 @@ sub psql
 		}
 	};
 
+	# Note: on Windows, IPC::Run seems to convert \r\n to \n in program output
+	# if we're using native Perl, but not if we're using MSys Perl.  So do it
+	# by hand in the latter case, here and elsewhere.
+
 	if (defined $$stdout)
 	{
+		$$stdout =~ s/\r\n/\n/g if $Config{osname} eq 'msys';
 		chomp $$stdout;
-		$$stdout =~ s/\r//g if $TestLib::windows_os;
 	}
 
 	if (defined $$stderr)
 	{
+		$$stderr =~ s/\r\n/\n/g if $Config{osname} eq 'msys';
 		chomp $$stderr;
-		$$stderr =~ s/\r//g if $TestLib::windows_os;
 	}
 
 	# See http://perldoc.perl.org/perlvar.html#%24CHILD_ERROR
@@ -1560,73 +1522,6 @@ sub psql
 
 =pod
 
-=item $node->interactive_psql($dbname, \$stdin, \$stdout, $timer, %params) => harness
-
-Invoke B<psql> on B<$dbname> and return an IPC::Run harness object,
-which the caller may use to send interactive input to B<psql>.
-The process's stdin is sourced from the $stdin scalar reference,
-and its stdout and stderr go to the $stdout scalar reference.
-ptys are used so that psql thinks it's being called interactively.
-
-The specified timer object is attached to the harness, as well.
-It's caller's responsibility to select the timeout length, and to
-restart the timer after each command if the timeout is per-command.
-
-psql is invoked in tuples-only unaligned mode with reading of B<.psqlrc>
-disabled.  That may be overridden by passing extra psql parameters.
-
-Dies on failure to invoke psql, or if psql fails to connect.
-Errors occurring later are the caller's problem.
-
-Be sure to "finish" the harness when done with it.
-
-The only extra parameter currently accepted is
-
-=over
-
-=item extra_params => ['--single-transaction']
-
-If given, it must be an array reference containing additional parameters to B<psql>.
-
-=back
-
-This requires IO::Pty in addition to IPC::Run.
-
-=cut
-
-sub interactive_psql
-{
-	my ($self, $dbname, $stdin, $stdout, $timer, %params) = @_;
-
-	my @psql_params = ('psql', '-XAt', '-d', $self->connstr($dbname));
-
-	push @psql_params, @{ $params{extra_params} }
-	  if defined $params{extra_params};
-
-	# Ensure there is no data waiting to be sent:
-	$$stdin = "" if ref($stdin);
-	# IPC::Run would otherwise append to existing contents:
-	$$stdout = "" if ref($stdout);
-
-	my $harness = IPC::Run::start \@psql_params,
-	  '<pty<', $stdin, '>pty>', $stdout, $timer;
-
-	# Pump until we see psql's help banner.  This ensures that callers
-	# won't write anything to the pty before it's ready, avoiding an
-	# implementation issue in IPC::Run.  Also, it means that psql
-	# connection failures are caught here, relieving callers of
-	# the need to handle those.  (Right now, we have no particularly
-	# good handling for errors anyway, but that might be added later.)
-	pump $harness
-	  until $$stdout =~ /Type "help" for help/ || $timer->is_expired;
-
-	die "psql startup timed out" if $timer->is_expired;
-
-	return $harness;
-}
-
-=pod
-
 =item $node->poll_query_until($dbname, $query [, $expected ])
 
 Run B<$query> repeatedly, until it returns the B<$expected> result
@@ -1652,8 +1547,8 @@ sub poll_query_until
 	{
 		my $result = IPC::Run::run $cmd, '>', \$stdout, '2>', \$stderr;
 
+		$stdout =~ s/\r\n/\n/g if $Config{osname} eq 'msys';
 		chomp($stdout);
-		$stdout =~ s/\r//g if $TestLib::windows_os;
 
 		if ($stdout eq $expected)
 		{
@@ -1668,8 +1563,8 @@ sub poll_query_until
 
 	# The query result didn't change in 180 seconds. Give up. Print the
 	# output from the last attempt, hopefully that's useful for debugging.
+	$stderr =~ s/\r\n/\n/g if $Config{osname} eq 'msys';
 	chomp($stderr);
-	$stderr =~ s/\r//g if $TestLib::windows_os;
 	diag qq(poll_query_until timed out executing this query:
 $query
 expecting this output:
@@ -2113,8 +2008,8 @@ sub pg_recvlogical_upto
 		}
 	};
 
-	$stdout =~ s/\r//g if $TestLib::windows_os;
-	$stderr =~ s/\r//g if $TestLib::windows_os;
+	$stdout =~ s/\r\n/\n/g if $Config{osname} eq 'msys';
+	$stderr =~ s/\r\n/\n/g if $Config{osname} eq 'msys';
 
 	if (wantarray)
 	{

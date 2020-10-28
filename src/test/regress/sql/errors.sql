@@ -366,10 +366,8 @@ NOT
 NULL);
 
 -- Check that stack depth detection mechanism works and
--- max_stack_depth is not set too high.  The full error report is not
--- very stable, so show only SQLSTATE and primary error message.
+-- max_stack_depth is not set too high
 create function infinite_recurse() returns int as
 'select infinite_recurse()' language sql;
-\set VERBOSITY sqlstate
+\set VERBOSITY terse
 select infinite_recurse();
-\echo :LAST_ERROR_MESSAGE

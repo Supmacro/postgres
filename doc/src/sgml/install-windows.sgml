@@ -46,7 +46,8 @@
   <productname>Cygwin</productname> is not recommended for running a
   production server, and it should only be used for running on
   older versions of <productname>Windows</productname> where
-  the native build does not work. The official
+  the native build does not work, such as
+  <productname>Windows 98</productname>. The official
   binaries are built using <productname>Visual Studio</productname>.
  </para>
 
@@ -287,7 +288,7 @@ $ENV{MSBFLAGS}="/m";
      <listitem><para>
       Required for GSSAPI authentication support. MIT Kerberos can be
       downloaded from
-      <ulink url="http://web.mit.edu/Kerberos/dist/index.html"></ulink>.
+      <ulink url="https://web.mit.edu/Kerberos/dist/index.html"></ulink>.
      </para></listitem>
     </varlistentry>
 
@@ -296,7 +297,7 @@ $ENV{MSBFLAGS}="/m";
       <productname>libxslt</productname></term>
      <listitem><para>
       Required for XML support. Binaries can be downloaded from
-      <ulink url="http://zlatkovic.com/pub/libxml"></ulink> or source from
+      <ulink url="https://zlatkovic.com/pub/libxml"></ulink> or source from
       <ulink url="http://xmlsoft.org"></ulink>. Note that libxml2 requires iconv,
       which is available from the same download location.
      </para></listitem>
@@ -333,7 +334,7 @@ $ENV{MSBFLAGS}="/m";
      <listitem><para>
       Required for compression support in <application>pg_dump</application>
       and <application>pg_restore</application>. Binaries can be downloaded
-      from <ulink url="http://www.zlib.net"></ulink>.
+      from <ulink url="https://www.zlib.net"></ulink>.
      </para></listitem>
     </varlistentry>
 

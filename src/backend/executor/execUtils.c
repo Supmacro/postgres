@@ -3,7 +3,7 @@
  * execUtils.c
  *	  miscellaneous executor utility routines
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -53,7 +53,6 @@
 #include "executor/executor.h"
 #include "jit/jit.h"
 #include "mb/pg_wchar.h"
-#include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parsetree.h"
 #include "partitioning/partdesc.h"
@@ -114,6 +113,7 @@ CreateExecutorState(void)
 	estate->es_snapshot = InvalidSnapshot;	/* caller must initialize this */
 	estate->es_crosscheck_snapshot = InvalidSnapshot;	/* no crosscheck */
 	estate->es_range_table = NIL;
+	estate->es_range_table_array = NULL;
 	estate->es_range_table_size = 0;
 	estate->es_relations = NULL;
 	estate->es_rowmarks = NULL;
@@ -228,13 +228,21 @@ FreeExecutorState(EState *estate)
 	MemoryContextDelete(estate->es_query_cxt);
 }
 
-/*
- * Internal implementation for CreateExprContext() and CreateWorkExprContext()
- * that allows control over the AllocSet parameters.
+/* ----------------
+ *		CreateExprContext
+ *
+ *		Create a context for expression evaluation within an EState.
+ *
+ * An executor run may require multiple ExprContexts (we usually make one
+ * for each Plan node, and a separate one for per-output-tuple processing
+ * such as constraint checking).  Each ExprContext has its own "per-tuple"
+ * memory context.
+ *
+ * Note we make no assumption about the caller's memory context.
+ * ----------------
  */
-static ExprContext *
-CreateExprContextInternal(EState *estate, Size minContextSize,
-						  Size initBlockSize, Size maxBlockSize)
+ExprContext *
+CreateExprContext(EState *estate)
 {
 	ExprContext *econtext;
 	MemoryContext oldcontext;
@@ -257,9 +265,7 @@ CreateExprContextInternal(EState *estate, Size minContextSize,
 	econtext->ecxt_per_tuple_memory =
 		AllocSetContextCreate(estate->es_query_cxt,
 							  "ExprContext",
-							  minContextSize,
-							  initBlockSize,
-							  maxBlockSize);
+							  ALLOCSET_DEFAULT_SIZES);
 
 	econtext->ecxt_param_exec_vals = estate->es_param_exec_vals;
 	econtext->ecxt_param_list_info = estate->es_param_list_info;
@@ -287,52 +293,6 @@ CreateExprContextInternal(EState *estate, Size minContextSize,
 	MemoryContextSwitchTo(oldcontext);
 
 	return econtext;
-}
-
-/* ----------------
- *		CreateExprContext
- *
- *		Create a context for expression evaluation within an EState.
- *
- * An executor run may require multiple ExprContexts (we usually make one
- * for each Plan node, and a separate one for per-output-tuple processing
- * such as constraint checking).  Each ExprContext has its own "per-tuple"
- * memory context.
- *
- * Note we make no assumption about the caller's memory context.
- * ----------------
- */
-ExprContext *
-CreateExprContext(EState *estate)
-{
-	return CreateExprContextInternal(estate, ALLOCSET_DEFAULT_SIZES);
-}
-
-
-/* ----------------
- *		CreateWorkExprContext
- *
- * Like CreateExprContext, but specifies the AllocSet sizes to be reasonable
- * in proportion to work_mem. If the maximum block allocation size is too
- * large, it's easy to skip right past work_mem with a single allocation.
- * ----------------
- */
-ExprContext *
-CreateWorkExprContext(EState *estate)
-{
-	Size		minContextSize = ALLOCSET_DEFAULT_MINSIZE;
-	Size		initBlockSize = ALLOCSET_DEFAULT_INITSIZE;
-	Size		maxBlockSize = ALLOCSET_DEFAULT_MAXSIZE;
-
-	/* choose the maxBlockSize to be no larger than 1/16 of work_mem */
-	while (16 * maxBlockSize > work_mem * 1024L)
-		maxBlockSize >>= 1;
-
-	if (maxBlockSize < ALLOCSET_DEFAULT_INITSIZE)
-		maxBlockSize = ALLOCSET_DEFAULT_INITSIZE;
-
-	return CreateExprContextInternal(estate, minContextSize,
-									 initBlockSize, maxBlockSize);
 }
 
 /* ----------------
@@ -626,7 +586,7 @@ tlist_matches_tupdesc(PlanState *ps, List *tlist, Index varno, TupleDesc tupdesc
 			 var->vartypmod != -1))
 			return false;		/* type mismatch */
 
-		tlist_item = lnext(tlist, tlist_item);
+		tlist_item = lnext(tlist_item);
 	}
 
 	if (tlist_item)
@@ -758,17 +718,29 @@ ExecOpenScanRelation(EState *estate, Index scanrelid, int eflags)
  * ExecInitRangeTable
  *		Set up executor's range-table-related data
  *
- * In addition to the range table proper, initialize arrays that are
- * indexed by rangetable index.
+ * We build an array from the range table list to allow faster lookup by RTI.
+ * (The es_range_table field is now somewhat redundant, but we keep it to
+ * avoid breaking external code unnecessarily.)
+ * This is also a convenient place to set up the parallel es_relations array.
  */
 void
 ExecInitRangeTable(EState *estate, List *rangeTable)
 {
+	Index		rti;
+	ListCell   *lc;
+
 	/* Remember the range table List as-is */
 	estate->es_range_table = rangeTable;
 
-	/* Set size of associated arrays */
+	/* Set up the equivalent array representation */
 	estate->es_range_table_size = list_length(rangeTable);
+	estate->es_range_table_array = (RangeTblEntry **)
+		palloc(estate->es_range_table_size * sizeof(RangeTblEntry *));
+	rti = 0;
+	foreach(lc, rangeTable)
+	{
+		estate->es_range_table_array[rti++] = lfirst_node(RangeTblEntry, lc);
+	}
 
 	/*
 	 * Allocate an array to store an open Relation corresponding to each
@@ -779,8 +751,8 @@ ExecInitRangeTable(EState *estate, List *rangeTable)
 		palloc0(estate->es_range_table_size * sizeof(Relation));
 
 	/*
-	 * es_rowmarks is also parallel to the es_range_table, but it's allocated
-	 * only if needed.
+	 * es_rowmarks is also parallel to the es_range_table_array, but it's
+	 * allocated only if needed.
 	 */
 	estate->es_rowmarks = NULL;
 }

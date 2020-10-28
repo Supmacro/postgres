@@ -49,7 +49,7 @@ setup
   r bool;
   BEGIN
   EXECUTE format('SELECT $1 %s $2', p_op) INTO r USING p_a, p_b;
-  RAISE NOTICE '%: % % % % %: %', p_comment, pg_typeof(p_a), p_a, p_op, pg_typeof(p_b), p_b, r;
+  RAISE WARNING '%: % % % % %: %', p_comment, pg_typeof(p_a), p_a, p_op, pg_typeof(p_b), p_b, r;
   RETURN r;
   END;$$;
 }
@@ -67,7 +67,7 @@ teardown
 }
 
 session "s1"
-setup		{ BEGIN ISOLATION LEVEL READ COMMITTED; }
+setup		{ BEGIN ISOLATION LEVEL READ COMMITTED; SET client_min_messages = 'WARNING'; }
 # wx1 then wx2 checks the basic case of re-fetching up-to-date values
 step "wx1"	{ UPDATE accounts SET balance = balance - 200 WHERE accountid = 'checking' RETURNING balance; }
 # wy1 then wy2 checks the case where quals pass then fail
@@ -186,7 +186,7 @@ step "simplepartupdate_noroute" {
 
 
 session "s2"
-setup		{ BEGIN ISOLATION LEVEL READ COMMITTED; }
+setup		{ BEGIN ISOLATION LEVEL READ COMMITTED; SET client_min_messages = 'WARNING'; }
 step "wx2"	{ UPDATE accounts SET balance = balance + 450 WHERE accountid = 'checking' RETURNING balance; }
 step "wy2"	{ UPDATE accounts SET balance = balance + 1000 WHERE accountid = 'checking' AND balance < 1000  RETURNING balance; }
 step "d2"	{ DELETE FROM accounts WHERE accountid = 'checking'; }
@@ -269,7 +269,7 @@ step "c2"	{ COMMIT; }
 step "r2"	{ ROLLBACK; }
 
 session "s3"
-setup		{ BEGIN ISOLATION LEVEL READ COMMITTED; }
+setup		{ BEGIN ISOLATION LEVEL READ COMMITTED; SET client_min_messages = 'WARNING'; }
 step "read"	{ SELECT * FROM accounts ORDER BY accountid; }
 step "read_ext"	{ SELECT * FROM accounts_ext ORDER BY accountid; }
 step "read_a"	{ SELECT * FROM table_a ORDER BY id; }

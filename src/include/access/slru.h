@@ -3,7 +3,7 @@
  * slru.h
  *		Simple LRU buffering for transaction status logfiles
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/slru.h
@@ -31,6 +31,9 @@
  * segment and page numbers in SimpleLruTruncate (see PagePrecedes()).
  */
 #define SLRU_PAGES_PER_SEGMENT	32
+
+/* Maximum length of an SLRU name */
+#define SLRU_MAX_NAME_LENGTH	32
 
 /*
  * Page status codes.  Note that these do not include the "dirty" bit.
@@ -65,7 +68,6 @@ typedef struct SlruSharedData
 	bool	   *page_dirty;
 	int		   *page_number;
 	int		   *page_lru_count;
-	LWLockPadded *buffer_locks;
 
 	/*
 	 * Optional array of WAL flush LSNs associated with entries in the SLRU
@@ -96,8 +98,10 @@ typedef struct SlruSharedData
 	 */
 	int			latest_page_number;
 
-	/* SLRU's index for statistics purposes (might not be unique) */
-	int			slru_stats_idx;
+	/* LWLocks */
+	int			lwlock_tranche_id;
+	char		lwlock_tranche_name[SLRU_MAX_NAME_LENGTH];
+	LWLockPadded *buffer_locks;
 } SlruSharedData;
 
 typedef SlruSharedData *SlruShared;

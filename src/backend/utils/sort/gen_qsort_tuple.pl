@@ -1,4 +1,4 @@
-#!/usr/bin/perl
+#!/usr/bin/perl -w
 
 #
 # gen_qsort_tuple.pl
@@ -26,7 +26,6 @@
 #
 
 use strict;
-use warnings;
 
 my $SUFFIX;
 my $EXTRAARGS;

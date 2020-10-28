@@ -3,7 +3,7 @@
  * filemap.c
  *	  A data structure for keeping track of files that have changed.
  *
- * Copyright (c) 2013-2020, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2019, PostgreSQL Global Development Group
  *
  *-------------------------------------------------------------------------
  */
@@ -13,11 +13,12 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "catalog/pg_tablespace_d.h"
-#include "common/string.h"
 #include "datapagemap.h"
 #include "filemap.h"
 #include "pg_rewind.h"
+
+#include "common/string.h"
+#include "catalog/pg_tablespace_d.h"
 #include "storage/fd.h"
 
 filemap_t  *filemap = NULL;
@@ -75,7 +76,7 @@ static const char *excludeDirContents[] =
 
 	/*
 	 * Old contents are loaded for possible debugging but are not required for
-	 * normal operation, see SerialInit().
+	 * normal operation, see OldSerXidInit().
 	 */
 	"pg_serial",
 
@@ -112,14 +113,6 @@ static const struct exclude_list_item excludeFiles[] =
 	 */
 	{"backup_label", false},	/* defined as BACKUP_LABEL_FILE */
 	{"tablespace_map", false},	/* defined as TABLESPACE_MAP */
-
-	/*
-	 * If there's a backup_manifest, it belongs to a backup that was used to
-	 * start this server. It is *not* correct for this backup. Our
-	 * backup_manifest is injected into the backup separately if users want
-	 * it.
-	 */
-	{"backup_manifest", false},
 
 	{"postmaster.pid", false},
 	{"postmaster.opts", false},

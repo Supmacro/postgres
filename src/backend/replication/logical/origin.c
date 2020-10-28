@@ -3,7 +3,7 @@
  * origin.c
  *	  Logical replication progress tracking support.
  *
- * Copyright (c) 2013-2020, PostgreSQL Global Development Group
+ * Copyright (c) 2013-2019, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/replication/logical/origin.c
@@ -70,29 +70,33 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include "funcapi.h"
+#include "miscadmin.h"
+
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
+
 #include "catalog/catalog.h"
 #include "catalog/indexing.h"
-#include "funcapi.h"
-#include "miscadmin.h"
 #include "nodes/execnodes.h"
-#include "pgstat.h"
-#include "replication/logical.h"
+
 #include "replication/origin.h"
-#include "storage/condition_variable.h"
-#include "storage/copydir.h"
+#include "replication/logical.h"
+#include "pgstat.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
+#include "storage/condition_variable.h"
+#include "storage/copydir.h"
+
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/pg_lsn.h"
 #include "utils/rel.h"
-#include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/snapmgr.h"
 
 /*
  * Replay progress of a single remote node.
@@ -514,7 +518,7 @@ ReplicationOriginShmemInit(void)
 
 		MemSet(replication_states_ctl, 0, ReplicationOriginShmemSize());
 
-		replication_states_ctl->tranche_id = LWTRANCHE_REPLICATION_ORIGIN_STATE;
+		replication_states_ctl->tranche_id = LWTRANCHE_REPLICATION_ORIGIN;
 
 		for (i = 0; i < max_replication_slots; i++)
 		{
@@ -523,6 +527,9 @@ ReplicationOriginShmemInit(void)
 			ConditionVariableInit(&replication_states[i].origin_cv);
 		}
 	}
+
+	LWLockRegisterTranche(replication_states_ctl->tranche_id,
+						  "replication_origin");
 }
 
 /* ---------------------------------------------------------------------------
@@ -649,7 +656,7 @@ CheckPointReplicationOrigin(void)
 						tmppath)));
 	}
 
-	if (CloseTransientFile(tmpfd) != 0)
+	if (CloseTransientFile(tmpfd))
 		ereport(PANIC,
 				(errcode_for_file_access(),
 				 errmsg("could not close file \"%s\": %m",
@@ -788,7 +795,7 @@ StartupReplicationOrigin(void)
 				 errmsg("replication slot checkpoint has wrong checksum %u, expected %u",
 						crc, file_crc)));
 
-	if (CloseTransientFile(fd) != 0)
+	if (CloseTransientFile(fd))
 		ereport(PANIC,
 				(errcode_for_file_access(),
 				 errmsg("could not close file \"%s\": %m",

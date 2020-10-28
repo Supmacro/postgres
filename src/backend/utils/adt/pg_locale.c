@@ -2,7 +2,7 @@
  *
  * PostgreSQL locale utilities
  *
- * Portions Copyright (c) 2002-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2002-2019, PostgreSQL Global Development Group
  *
  * src/backend/utils/adt/pg_locale.c
  *
@@ -70,10 +70,6 @@
 #include <unicode/ucnv.h>
 #endif
 
-#ifdef __GLIBC__
-#include <gnu/libc-version.h>
-#endif
-
 #ifdef WIN32
 /*
  * This Windows file defines StrNCpy. We don't need it here, so we undefine
@@ -83,7 +79,7 @@
 #undef StrNCpy
 #include <shlwapi.h>
 #ifdef StrNCpy
-#undef StrNCpy
+#undef STrNCpy
 #endif
 #endif
 
@@ -96,17 +92,11 @@ char	   *locale_monetary;
 char	   *locale_numeric;
 char	   *locale_time;
 
-/*
- * lc_time localization cache.
- *
- * We use only the first 7 or 12 entries of these arrays.  The last array
- * element is left as NULL for the convenience of outside code that wants
- * to sequentially scan these arrays.
- */
-char	   *localized_abbrev_days[7 + 1];
-char	   *localized_full_days[7 + 1];
-char	   *localized_abbrev_months[12 + 1];
-char	   *localized_full_months[12 + 1];
+/* lc_time localization cache */
+char	   *localized_abbrev_days[7];
+char	   *localized_full_days[7];
+char	   *localized_abbrev_months[12];
+char	   *localized_full_months[12];
 
 /* indicates whether locale information cache is valid */
 static bool CurrentLocaleConvValid = false;
@@ -929,8 +919,6 @@ cache_locale_time(void)
 		cache_single_string(&localized_full_days[i], bufptr, encoding);
 		bufptr += MAX_L10N_DATA;
 	}
-	localized_abbrev_days[7] = NULL;
-	localized_full_days[7] = NULL;
 
 	/* localized months */
 	for (i = 0; i < 12; i++)
@@ -940,8 +928,6 @@ cache_locale_time(void)
 		cache_single_string(&localized_full_months[i], bufptr, encoding);
 		bufptr += MAX_L10N_DATA;
 	}
-	localized_abbrev_months[12] = NULL;
-	localized_full_months[12] = NULL;
 
 	CurrentLCTimeValid = true;
 }
@@ -1139,6 +1125,7 @@ get_iso_localename(const char *winlocname)
 		hyphen = strchr(iso_lc_messages, '-');
 		if (hyphen)
 			*hyphen = '_';
+
 		return iso_lc_messages;
 	}
 
@@ -1149,8 +1136,9 @@ get_iso_localename(const char *winlocname)
 static char *
 IsoLocaleName(const char *winlocname)
 {
-#if defined(_MSC_VER)
-	static char iso_lc_messages[LOCALE_NAME_MAX_LENGTH];
+#if (_MSC_VER >= 1400)			/* VC8.0 or later */
+	static char iso_lc_messages[32];
+	_locale_t	loct = NULL;
 
 	if (pg_strcasecmp("c", winlocname) == 0 ||
 		pg_strcasecmp("posix", winlocname) == 0)
@@ -1158,49 +1146,63 @@ IsoLocaleName(const char *winlocname)
 		strcpy(iso_lc_messages, "C");
 		return iso_lc_messages;
 	}
-	else
-	{
+
 #if (_MSC_VER >= 1900)			/* Visual Studio 2015 or later */
-		return get_iso_localename(winlocname);
+	return get_iso_localename(winlocname);
 #else
-		_locale_t	loct;
+	loct = _create_locale(LC_CTYPE, winlocname);
+	if (loct != NULL)
+	{
+#if (_MSC_VER >= 1700)			/* Visual Studio 2012 or later */
+		size_t		rc;
+		char	   *hyphen;
 
-		loct = _create_locale(LC_CTYPE, winlocname);
-		if (loct != NULL)
-		{
-			size_t		rc;
-			char	   *hyphen;
+		/* Locale names use only ASCII, any conversion locale suffices. */
+		rc = wchar2char(iso_lc_messages, loct->locinfo->locale_name[LC_CTYPE],
+						sizeof(iso_lc_messages), NULL);
+		_free_locale(loct);
+		if (rc == -1 || rc == sizeof(iso_lc_messages))
+			return NULL;
 
-			/* Locale names use only ASCII, any conversion locale suffices. */
-			rc = wchar2char(iso_lc_messages, loct->locinfo->locale_name[LC_CTYPE],
-							sizeof(iso_lc_messages), NULL);
-			_free_locale(loct);
-			if (rc == -1 || rc == sizeof(iso_lc_messages))
-				return NULL;
+		/*
+		 * Since the message catalogs sit on a case-insensitive filesystem, we
+		 * need not standardize letter case here.  So long as we do not ship
+		 * message catalogs for which it would matter, we also need not
+		 * translate the script/variant portion, e.g. uz-Cyrl-UZ to
+		 * uz_UZ@cyrillic.  Simply replace the hyphen with an underscore.
+		 *
+		 * Note that the locale name can be less-specific than the value we
+		 * would derive under earlier Visual Studio releases.  For example,
+		 * French_France.1252 yields just "fr".  This does not affect any of
+		 * the country-specific message catalogs available as of this writing
+		 * (pt_BR, zh_CN, zh_TW).
+		 */
+		hyphen = strchr(iso_lc_messages, '-');
+		if (hyphen)
+			*hyphen = '_';
+#else
+		char		isolang[32],
+					isocrty[32];
+		LCID		lcid;
 
-			/*
-			 * Since the message catalogs sit on a case-insensitive
-			 * filesystem, we need not standardize letter case here.  So long
-			 * as we do not ship message catalogs for which it would matter,
-			 * we also need not translate the script/variant portion, e.g.
-			 * uz-Cyrl-UZ to uz_UZ@cyrillic.  Simply replace the hyphen with
-			 * an underscore.
-			 *
-			 * Note that the locale name can be less-specific than the value
-			 * we would derive under earlier Visual Studio releases.  For
-			 * example, French_France.1252 yields just "fr".  This does not
-			 * affect any of the country-specific message catalogs available
-			 * as of this writing (pt_BR, zh_CN, zh_TW).
-			 */
-			hyphen = strchr(iso_lc_messages, '-');
-			if (hyphen)
-				*hyphen = '_';
-			return iso_lc_messages;
-		}
-#endif							/* Visual Studio 2015 or later */
+		lcid = loct->locinfo->lc_handle[LC_CTYPE];
+		if (lcid == 0)
+			lcid = MAKELCID(MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US), SORT_DEFAULT);
+		_free_locale(loct);
+
+		if (!GetLocaleInfoA(lcid, LOCALE_SISO639LANGNAME, isolang, sizeof(isolang)))
+			return NULL;
+		if (!GetLocaleInfoA(lcid, LOCALE_SISO3166CTRYNAME, isocrty, sizeof(isocrty)))
+			return NULL;
+		snprintf(iso_lc_messages, sizeof(iso_lc_messages) - 1, "%s_%s", isolang, isocrty);
+#endif
+		return iso_lc_messages;
 	}
-#endif							/* defined(_MSC_VER) */
+	return NULL;
+#endif							/* Visual Studio 2015 or later */
+#else
 	return NULL;				/* Not supported on this version of msvc/mingw */
+#endif							/* _MSC_VER >= 1400 */
 }
 #endif							/* WIN32 && LC_MESSAGES */
 
@@ -1675,11 +1677,15 @@ pg_newlocale_from_collation(Oid collid)
 /*
  * Get provider-specific collation version string for the given collation from
  * the operating system/library.
+ *
+ * A particular provider must always either return a non-NULL string or return
+ * NULL (if it doesn't support versions).  It must not return NULL for some
+ * collcollate and not NULL for others.
  */
 char *
 get_collation_actual_version(char collprovider, const char *collcollate)
 {
-	char	   *collversion = NULL;
+	char	   *collversion;
 
 #ifdef USE_ICU
 	if (collprovider == COLLPROVIDER_ICU)
@@ -1703,57 +1709,7 @@ get_collation_actual_version(char collprovider, const char *collcollate)
 	}
 	else
 #endif
-	if (collprovider == COLLPROVIDER_LIBC)
-	{
-#if defined(__GLIBC__)
-		char	   *copy = pstrdup(collcollate);
-		char	   *copy_suffix = strstr(copy, ".");
-		bool		need_version = true;
-
-		/*
-		 * Check for names like C.UTF-8 by chopping off the encoding suffix on
-		 * our temporary copy, so we can skip the version.
-		 */
-		if (copy_suffix)
-			*copy_suffix = '\0';
-		if (pg_strcasecmp("c", copy) == 0 ||
-			pg_strcasecmp("posix", copy) == 0)
-			need_version = false;
-		pfree(copy);
-		if (!need_version)
-			return NULL;
-
-		/* Use the glibc version because we don't have anything better. */
-		collversion = pstrdup(gnu_get_libc_version());
-#elif defined(WIN32) && _WIN32_WINNT >= 0x0600
-		/*
-		 * If we are targeting Windows Vista and above, we can ask for a name
-		 * given a collation name (earlier versions required a location code
-		 * that we don't have).
-		 */
-		NLSVERSIONINFOEX version = {sizeof(NLSVERSIONINFOEX)};
-		WCHAR		wide_collcollate[LOCALE_NAME_MAX_LENGTH];
-
-		/* These would be invalid arguments, but have no version. */
-		if (pg_strcasecmp("c", collcollate) == 0 ||
-			pg_strcasecmp("posix", collcollate) == 0)
-			return NULL;
-
-		/* For all other names, ask the OS. */
-		MultiByteToWideChar(CP_ACP, 0, collcollate, -1, wide_collcollate,
-							LOCALE_NAME_MAX_LENGTH);
-		if (!GetNLSVersionEx(COMPARE_STRING, wide_collcollate, &version))
-			ereport(ERROR,
-					(errmsg("could not get collation version for locale \"%s\": error code %lu",
-							collcollate,
-							GetLastError())));
-		collversion = psprintf("%d.%d,%d.%d",
-							   (version.dwNLSVersion >> 8) & 0xFFFF,
-							   version.dwNLSVersion & 0xFF,
-							   (version.dwDefinedVersion >> 8) & 0xFFFF,
-							   version.dwDefinedVersion & 0xFF);
-#endif
-	}
+		collversion = NULL;
 
 	return collversion;
 }
@@ -1775,14 +1731,9 @@ init_icu_converter(void)
 	UConverter *conv;
 
 	if (icu_converter)
-		return;					/* already done */
+		return;
 
 	icu_encoding_name = get_encoding_name_for_icu(GetDatabaseEncoding());
-	if (!icu_encoding_name)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("encoding \"%s\" not supported by ICU",
-						pg_encoding_to_char(GetDatabaseEncoding()))));
 
 	status = U_ZERO_ERROR;
 	conv = ucnv_open(icu_encoding_name, &status);
@@ -2132,7 +2083,7 @@ char2wchar(wchar_t *to, size_t tolen, const char *from, size_t fromlen,
 		 * error message by letting pg_verifymbstr check the string.  But it's
 		 * possible that the string is OK to us, and not OK to mbstowcs ---
 		 * this suggests that the LC_CTYPE locale is different from the
-		 * database encoding.  Give a generic error message if pg_verifymbstr
+		 * database encoding.  Give a generic error message if verifymbstr
 		 * can't find anything wrong.
 		 */
 		pg_verifymbstr(from, fromlen, false);	/* might not return */

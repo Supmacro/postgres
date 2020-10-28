@@ -3,7 +3,7 @@
  * float.c
  *	  Functions for the built-in floating-point types.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -71,6 +71,19 @@ static unsigned short drandom_seed[3] = {0, 0, 0};
 static double sind_q1(double x);
 static double cosd_q1(double x);
 static void init_degree_constants(void);
+
+#ifndef HAVE_CBRT
+/*
+ * Some machines (in particular, some versions of AIX) have an extern
+ * declaration for cbrt() in <math.h> but fail to provide the actual
+ * function, which causes configure to not set HAVE_CBRT.  Furthermore,
+ * their compilers spit up at the mismatch between extern declaration
+ * and static definition.  We work around that here by the expedient
+ * of a #define to make the actual name of the static function different.
+ */
+#define cbrt my_cbrt
+static double cbrt(double x);
+#endif							/* HAVE_CBRT */
 
 
 /*
@@ -356,7 +369,7 @@ float8in(PG_FUNCTION_ARGS)
 }
 
 /* Convenience macro: set *have_error flag (if provided) or throw error */
-#define RETURN_ERROR(throw_error, have_error) \
+#define RETURN_ERROR(throw_error) \
 do { \
 	if (have_error) { \
 		*have_error = true; \
@@ -395,9 +408,6 @@ float8in_internal_opt_error(char *num, char **endptr_p,
 	double		val;
 	char	   *endptr;
 
-	if (have_error)
-		*have_error = false;
-
 	/* skip leading whitespace */
 	while (*num != '\0' && isspace((unsigned char) *num))
 		num++;
@@ -410,8 +420,7 @@ float8in_internal_opt_error(char *num, char **endptr_p,
 		RETURN_ERROR(ereport(ERROR,
 							 (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 							  errmsg("invalid input syntax for type %s: \"%s\"",
-									 type_name, orig_string))),
-					 have_error);
+									 type_name, orig_string))));
 
 	errno = 0;
 	val = strtod(num, &endptr);
@@ -486,9 +495,9 @@ float8in_internal_opt_error(char *num, char **endptr_p,
 				errnumber[endptr - num] = '\0';
 				RETURN_ERROR(ereport(ERROR,
 									 (errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-									  errmsg("\"%s\" is out of range for type double precision",
-											 errnumber))),
-							 have_error);
+									  errmsg("\"%s\" is out of range for "
+											 "type double precision",
+											 errnumber))));
 			}
 		}
 		else
@@ -496,8 +505,7 @@ float8in_internal_opt_error(char *num, char **endptr_p,
 								 (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 								  errmsg("invalid input syntax for type "
 										 "%s: \"%s\"",
-										 type_name, orig_string))),
-						 have_error);
+										 type_name, orig_string))));
 	}
 #ifdef HAVE_BUGGY_SOLARIS_STRTOD
 	else
@@ -524,8 +532,7 @@ float8in_internal_opt_error(char *num, char **endptr_p,
 							 (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
 							  errmsg("invalid input syntax for type "
 									 "%s: \"%s\"",
-									 type_name, orig_string))),
-					 have_error);
+									 type_name, orig_string))));
 
 	return val;
 }
@@ -2878,7 +2885,7 @@ float8_combine(PG_FUNCTION_ARGS)
 
 		result = construct_array(transdatums, 3,
 								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
+								 sizeof(float8), FLOAT8PASSBYVAL, 'd');
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -2925,6 +2932,17 @@ float8_accum(PG_FUNCTION_ARGS)
 			Sxx = get_float8_nan();
 		}
 	}
+	else
+	{
+		/*
+		 * At the first input, we normally can leave Sxx as 0.  However, if
+		 * the first input is Inf or NaN, we'd better force Sxx to NaN;
+		 * otherwise we will falsely report variance zero when there are no
+		 * more inputs.
+		 */
+		if (isnan(newval) || isinf(newval))
+			Sxx = get_float8_nan();
+	}
 
 	/*
 	 * If we're invoked as an aggregate, we can cheat and modify our first
@@ -2950,7 +2968,7 @@ float8_accum(PG_FUNCTION_ARGS)
 
 		result = construct_array(transdatums, 3,
 								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
+								 sizeof(float8), FLOAT8PASSBYVAL, 'd');
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -2999,6 +3017,17 @@ float4_accum(PG_FUNCTION_ARGS)
 			Sxx = get_float8_nan();
 		}
 	}
+	else
+	{
+		/*
+		 * At the first input, we normally can leave Sxx as 0.  However, if
+		 * the first input is Inf or NaN, we'd better force Sxx to NaN;
+		 * otherwise we will falsely report variance zero when there are no
+		 * more inputs.
+		 */
+		if (isnan(newval) || isinf(newval))
+			Sxx = get_float8_nan();
+	}
 
 	/*
 	 * If we're invoked as an aggregate, we can cheat and modify our first
@@ -3024,7 +3053,7 @@ float4_accum(PG_FUNCTION_ARGS)
 
 		result = construct_array(transdatums, 3,
 								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
+								 sizeof(float8), FLOAT8PASSBYVAL, 'd');
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -3225,6 +3254,19 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 				Sxy = get_float8_nan();
 		}
 	}
+	else
+	{
+		/*
+		 * At the first input, we normally can leave Sxx et al as 0.  However,
+		 * if the first input is Inf or NaN, we'd better force the dependent
+		 * sums to NaN; otherwise we will falsely report variance zero when
+		 * there are no more inputs.
+		 */
+		if (isnan(newvalX) || isinf(newvalX))
+			Sxx = Sxy = get_float8_nan();
+		if (isnan(newvalY) || isinf(newvalY))
+			Syy = Sxy = get_float8_nan();
+	}
 
 	/*
 	 * If we're invoked as an aggregate, we can cheat and modify our first
@@ -3256,7 +3298,7 @@ float8_regr_accum(PG_FUNCTION_ARGS)
 
 		result = construct_array(transdatums, 6,
 								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
+								 sizeof(float8), FLOAT8PASSBYVAL, 'd');
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -3397,7 +3439,7 @@ float8_regr_combine(PG_FUNCTION_ARGS)
 
 		result = construct_array(transdatums, 6,
 								 FLOAT8OID,
-								 sizeof(float8), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE);
+								 sizeof(float8), FLOAT8PASSBYVAL, 'd');
 
 		PG_RETURN_ARRAYTYPE_P(result);
 	}
@@ -3951,3 +3993,28 @@ width_bucket_float8(PG_FUNCTION_ARGS)
 
 	PG_RETURN_INT32(result);
 }
+
+/* ========== PRIVATE ROUTINES ========== */
+
+#ifndef HAVE_CBRT
+
+static double
+cbrt(double x)
+{
+	int			isneg = (x < 0.0);
+	double		absx = fabs(x);
+	double		tmpres = pow(absx, (double) 1.0 / (double) 3.0);
+
+	/*
+	 * The result is somewhat inaccurate --- not really pow()'s fault, as the
+	 * exponent it's handed contains roundoff error.  We can improve the
+	 * accuracy by doing one iteration of Newton's formula.  Beware of zero
+	 * input however.
+	 */
+	if (tmpres > 0.0)
+		tmpres -= (tmpres - absx / (tmpres * tmpres)) / (double) 3.0;
+
+	return isneg ? -tmpres : tmpres;
+}
+
+#endif							/* !HAVE_CBRT */

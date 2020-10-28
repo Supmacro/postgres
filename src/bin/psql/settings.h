@@ -1,15 +1,16 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2020, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2019, PostgreSQL Global Development Group
  *
  * src/bin/psql/settings.h
  */
 #ifndef SETTINGS_H
 #define SETTINGS_H
 
-#include "fe_utils/print.h"
+
 #include "variables.h"
+#include "fe_utils/print.h"
 
 #define DEFAULT_CSV_FIELD_SEP ','
 #define DEFAULT_FIELD_SEP "|"
@@ -23,8 +24,8 @@
 #define DEFAULT_EDITOR_LINENUMBER_ARG "+"
 #endif
 
-#define DEFAULT_PROMPT1 "%/%R%x%# "
-#define DEFAULT_PROMPT2 "%/%R%x%# "
+#define DEFAULT_PROMPT1 "%/%R%# "
+#define DEFAULT_PROMPT2 "%/%R%# "
 #define DEFAULT_PROMPT3 ">> "
 
 /*
@@ -88,11 +89,10 @@ typedef struct _psqlSettings
 
 	PGresult   *last_error_result;	/* most recent error result, if any */
 
-	printQueryOpt popt;			/* The active print format settings */
+	printQueryOpt popt;
 
 	char	   *gfname;			/* one-shot file output argument for \g */
-	printQueryOpt *gsavepopt;	/* if not null, saved print format settings */
-
+	bool		g_expanded;		/* one-shot expanded output requested via \gx */
 	char	   *gset_prefix;	/* one-shot prefix argument for \gset */
 	bool		gdesc_flag;		/* one-shot request to describe query results */
 	bool		gexec_flag;		/* one-shot request to execute query results */

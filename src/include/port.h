@@ -3,7 +3,7 @@
  * port.h
  *	  Header for src/port/ compatibility functions.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/port.h
@@ -102,11 +102,10 @@ extern void pgfnames_cleanup(char **filenames);
 /* Portable locale initialization (in exec.c) */
 extern void set_pglocale_pgservice(const char *argv0, const char *app);
 
-/* Portable way to find and execute binaries (in exec.c) */
+/* Portable way to find binaries (in exec.c) */
 extern int	find_my_exec(const char *argv0, char *retpath);
 extern int	find_other_exec(const char *argv0, const char *target,
 							const char *versionstr, char *retpath);
-extern char *pipe_read_line(char *cmd, char *line, int maxsize);
 
 /* Doesn't belong here, but this is used with find_other_exec(), so... */
 #define PG_BACKEND_VERSIONSTR "postgres (PostgreSQL) " PG_VERSION "\n"
@@ -331,10 +330,17 @@ extern int	gettimeofday(struct timeval *tp, struct timezone *tzp);
  * Default "extern" declarations or macro substitutes for library routines.
  * When necessary, these routines are provided by files in src/port/.
  */
+#ifndef HAVE_CRYPT
+extern char *crypt(const char *key, const char *setting);
+#endif
 
-/* Type to use with fseeko/ftello */
-#ifndef WIN32					/* WIN32 is handled in port/win32_port.h */
+/* WIN32 handled in port/win32_port.h */
+#ifndef WIN32
 #define pgoff_t off_t
+#ifdef __NetBSD__
+extern int	fseeko(FILE *stream, off_t offset, int whence);
+extern off_t ftello(FILE *stream);
+#endif
 #endif
 
 extern double pg_erand48(unsigned short xseed[3]);
@@ -346,13 +352,18 @@ extern void pg_srand48(long seed);
 extern int	fls(int mask);
 #endif
 
-#ifndef HAVE_GETPEEREID
-/* On Windows, Perl might have incompatible definitions of uid_t and gid_t. */
-#ifndef PLPERL_HAVE_UID_GID
-extern int	getpeereid(int sock, uid_t *uid, gid_t *gid);
-#endif
+#ifndef HAVE_FSEEKO
+#define fseeko(a, b, c) fseek(a, b, c)
+#define ftello(a)		ftell(a)
 #endif
 
+#if !defined(HAVE_GETPEEREID) && !defined(WIN32)
+extern int	getpeereid(int sock, uid_t *uid, gid_t *gid);
+#endif
+
+#ifndef HAVE_ISINF
+extern int	isinf(double x);
+#else
 /*
  * Glibc doesn't use the builtin for clang due to a *gcc* bug in a version
  * newer than the gcc compatibility clang claims to have. This would cause a
@@ -368,10 +379,7 @@ extern int	getpeereid(int sock, uid_t *uid, gid_t *gid);
 #define isinf __builtin_isinf
 #endif							/* __has_builtin(isinf) */
 #endif							/* __clang__ && !__cplusplus */
-
-#ifndef HAVE_EXPLICIT_BZERO
-extern void explicit_bzero(void *buf, size_t len);
-#endif
+#endif							/* !HAVE_ISINF */
 
 #ifndef HAVE_STRTOF
 extern float strtof(const char *nptr, char **endptr);
@@ -382,12 +390,12 @@ extern float pg_strtof(const char *nptr, char **endptr);
 #define strtof(a,b) (pg_strtof((a),(b)))
 #endif
 
-#ifndef HAVE_LINK
-extern int	link(const char *src, const char *dst);
-#endif
-
 #ifndef HAVE_MKDTEMP
 extern char *mkdtemp(char *path);
+#endif
+
+#ifndef HAVE_RINT
+extern double rint(double x);
 #endif
 
 #ifndef HAVE_INET_ATON
@@ -435,6 +443,10 @@ extern void unsetenv(const char *name);
 
 #ifndef HAVE_SRANDOM
 extern void srandom(unsigned int seed);
+#endif
+
+#ifndef HAVE_SSL_GET_CURRENT_COMPRESSION
+#define SSL_get_current_compression(x) 0
 #endif
 
 #ifndef HAVE_DLOPEN
@@ -491,8 +503,8 @@ extern int	pg_codepage_to_encoding(UINT cp);
 #endif
 
 /* port/inet_net_ntop.c */
-extern char *pg_inet_net_ntop(int af, const void *src, int bits,
-							  char *dst, size_t size);
+extern char *inet_net_ntop(int af, const void *src, int bits,
+						   char *dst, size_t size);
 
 /* port/pg_strong_random.c */
 extern bool pg_strong_random(void *buf, size_t len);
@@ -512,6 +524,11 @@ extern int	pg_mkdir_p(char *path, int omode);
 /* port/pqsignal.c */
 typedef void (*pqsigfunc) (int signo);
 extern pqsigfunc pqsignal(int signo, pqsigfunc func);
+#ifndef WIN32
+extern pqsigfunc pqsignal_no_restart(int signo, pqsigfunc func);
+#else
+#define pqsignal_no_restart(signo, func) pqsignal(signo, func)
+#endif
 
 /* port/quotes.c */
 extern char *escape_single_quotes_ascii(const char *src);

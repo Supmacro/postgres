@@ -3,7 +3,7 @@
  * nodeFuncs.c
  *		Various general-purpose manipulations of Node trees
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,12 +17,13 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
-#include "nodes/execnodes.h"
 #include "nodes/makefuncs.h"
+#include "nodes/execnodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+
 
 static bool expression_returns_set_walker(Node *node, void *context);
 static int	leftmostLoc(int loc1, int loc2);
@@ -441,7 +442,7 @@ exprTypmod(const Node *expr)
 				typmod = exprTypmod((Node *) linitial(cexpr->args));
 				if (typmod < 0)
 					return -1;	/* no point in trying harder */
-				for_each_cell(arg, cexpr->args, list_second_cell(cexpr->args))
+				for_each_cell(arg, lnext(list_head(cexpr->args)))
 				{
 					Node	   *e = (Node *) lfirst(arg);
 
@@ -469,7 +470,7 @@ exprTypmod(const Node *expr)
 				typmod = exprTypmod((Node *) linitial(mexpr->args));
 				if (typmod < 0)
 					return -1;	/* no point in trying harder */
-				for_each_cell(arg, mexpr->args, list_second_cell(mexpr->args))
+				for_each_cell(arg, lnext(list_head(mexpr->args)))
 				{
 					Node	   *e = (Node *) lfirst(arg);
 
@@ -3118,7 +3119,6 @@ expression_tree_mutator(Node *node,
 
 				FLATCOPY(newnode, appinfo, AppendRelInfo);
 				MUTATE(newnode->translated_vars, appinfo->translated_vars, List *);
-				/* Assume nothing need be done with parent_colnos[] */
 				return (Node *) newnode;
 			}
 			break;

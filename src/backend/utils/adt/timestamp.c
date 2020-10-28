@@ -3,7 +3,7 @@
  * timestamp.c
  *	  Functions for the built-in SQL types "timestamp" and "interval".
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -32,6 +32,7 @@
 #include "parser/scansup.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/date.h"
 #include "utils/datetime.h"
 #include "utils/float.h"
 
@@ -70,6 +71,7 @@ typedef struct
 
 static TimeOffset time2t(const int hour, const int min, const int sec, const fsec_t fsec);
 static Timestamp dt2local(Timestamp dt, int timezone);
+static void AdjustTimestampForTypmod(Timestamp *time, int32 typmod);
 static void AdjustIntervalForTypmod(Interval *interval, int32 typmod);
 static TimestampTz timestamp2timestamptz(Timestamp timestamp);
 static Timestamp timestamptz2timestamp(TimestampTz timestamp);
@@ -329,11 +331,11 @@ timestamp_scale(PG_FUNCTION_ARGS)
 }
 
 /*
- * AdjustTimestampForTypmodError --- round off a timestamp to suit given typmod
+ * AdjustTimestampForTypmod --- round off a timestamp to suit given typmod
  * Works for either timestamp or timestamptz.
  */
-bool
-AdjustTimestampForTypmodError(Timestamp *time, int32 typmod, bool *error)
+static void
+AdjustTimestampForTypmod(Timestamp *time, int32 typmod)
 {
 	static const int64 TimestampScales[MAX_TIMESTAMP_PRECISION + 1] = {
 		INT64CONST(1000000),
@@ -359,18 +361,10 @@ AdjustTimestampForTypmodError(Timestamp *time, int32 typmod, bool *error)
 		&& (typmod != -1) && (typmod != MAX_TIMESTAMP_PRECISION))
 	{
 		if (typmod < 0 || typmod > MAX_TIMESTAMP_PRECISION)
-		{
-			if (error)
-			{
-				*error = true;
-				return false;
-			}
-
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("timestamp(%d) precision must be between %d and %d",
 							typmod, 0, MAX_TIMESTAMP_PRECISION)));
-		}
 
 		if (*time >= INT64CONST(0))
 		{
@@ -383,15 +377,8 @@ AdjustTimestampForTypmodError(Timestamp *time, int32 typmod, bool *error)
 					  * TimestampScales[typmod]);
 		}
 	}
-
-	return true;
 }
 
-void
-AdjustTimestampForTypmod(Timestamp *time, int32 typmod)
-{
-	(void) AdjustTimestampForTypmodError(time, typmod, NULL);
-}
 
 /* timestamptz_in()
  * Convert a string to internal form.
@@ -581,18 +568,8 @@ make_timestamp_internal(int year, int month, int day,
 
 	date = date2j(tm.tm_year, tm.tm_mon, tm.tm_mday) - POSTGRES_EPOCH_JDATE;
 
-	/*
-	 * This should match the checks in DecodeTimeOnly, except that since we're
-	 * dealing with a float "sec" value, we also explicitly reject NaN.  (An
-	 * infinity input should get rejected by the range comparisons, but we
-	 * can't be sure how those will treat a NaN.)
-	 */
-	if (hour < 0 || min < 0 || min > MINS_PER_HOUR - 1 ||
-		isnan(sec) ||
-		sec < 0 || sec > SECS_PER_MINUTE ||
-		hour > HOURS_PER_DAY ||
-	/* test for > 24:00:00 */
-		(hour == HOURS_PER_DAY && (min > 0 || sec > 0)))
+	/* Check for time overflow */
+	if (float_time_overflows(hour, min, sec))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATETIME_FIELD_OVERFLOW),
 				 errmsg("time field value out of range: %d:%02d:%02g",
@@ -600,7 +577,7 @@ make_timestamp_internal(int year, int month, int day,
 
 	/* This should match tm2time */
 	time = (((hour * MINS_PER_HOUR + min) * SECS_PER_MINUTE)
-			* USECS_PER_SEC) + rint(sec * USECS_PER_SEC);
+			* USECS_PER_SEC) + (int64) rint(sec * USECS_PER_SEC);
 
 	result = date * USECS_PER_DAY + time;
 	/* check for major overflow */
@@ -1263,7 +1240,7 @@ interval_support(PG_FUNCTION_ARGS)
 
 		typmod = (Node *) lsecond(expr->args);
 
-		if (IsA(typmod, Const) && !((Const *) typmod)->constisnull)
+		if (IsA(typmod, Const) &&!((Const *) typmod)->constisnull)
 		{
 			Node	   *source = (Node *) linitial(expr->args);
 			int32		new_typmod = DatumGetInt32(((Const *) typmod)->constvalue);
@@ -1738,8 +1715,6 @@ timestamptz_to_time_t(TimestampTz t)
  * This is mostly for use in emitting messages.  The primary difference
  * from timestamptz_out is that we force the output format to ISO.  Note
  * also that the result is in a static buffer, not pstrdup'd.
- *
- * See also pg_strftime.
  */
 const char *
 timestamptz_to_str(TimestampTz t)
@@ -3423,7 +3398,7 @@ interval_accum(PG_FUNCTION_ARGS)
 	ArrayType  *result;
 
 	deconstruct_array(transarray,
-					  INTERVALOID, sizeof(Interval), false, TYPALIGN_DOUBLE,
+					  INTERVALOID, sizeof(Interval), false, 'd',
 					  &transdatums, NULL, &ndatums);
 	if (ndatums != 2)
 		elog(ERROR, "expected 2-element interval array");
@@ -3440,7 +3415,7 @@ interval_accum(PG_FUNCTION_ARGS)
 	transdatums[1] = IntervalPGetDatum(&N);
 
 	result = construct_array(transdatums, 2,
-							 INTERVALOID, sizeof(Interval), false, TYPALIGN_DOUBLE);
+							 INTERVALOID, sizeof(Interval), false, 'd');
 
 	PG_RETURN_ARRAYTYPE_P(result);
 }
@@ -3463,7 +3438,7 @@ interval_combine(PG_FUNCTION_ARGS)
 	ArrayType  *result;
 
 	deconstruct_array(transarray1,
-					  INTERVALOID, sizeof(Interval), false, TYPALIGN_DOUBLE,
+					  INTERVALOID, sizeof(Interval), false, 'd',
 					  &transdatums1, NULL, &ndatums1);
 	if (ndatums1 != 2)
 		elog(ERROR, "expected 2-element interval array");
@@ -3472,7 +3447,7 @@ interval_combine(PG_FUNCTION_ARGS)
 	N1 = *(DatumGetIntervalP(transdatums1[1]));
 
 	deconstruct_array(transarray2,
-					  INTERVALOID, sizeof(Interval), false, TYPALIGN_DOUBLE,
+					  INTERVALOID, sizeof(Interval), false, 'd',
 					  &transdatums2, NULL, &ndatums2);
 	if (ndatums2 != 2)
 		elog(ERROR, "expected 2-element interval array");
@@ -3489,7 +3464,7 @@ interval_combine(PG_FUNCTION_ARGS)
 	transdatums1[1] = IntervalPGetDatum(&N1);
 
 	result = construct_array(transdatums1, 2,
-							 INTERVALOID, sizeof(Interval), false, TYPALIGN_DOUBLE);
+							 INTERVALOID, sizeof(Interval), false, 'd');
 
 	PG_RETURN_ARRAYTYPE_P(result);
 }
@@ -3507,7 +3482,7 @@ interval_accum_inv(PG_FUNCTION_ARGS)
 	ArrayType  *result;
 
 	deconstruct_array(transarray,
-					  INTERVALOID, sizeof(Interval), false, TYPALIGN_DOUBLE,
+					  INTERVALOID, sizeof(Interval), false, 'd',
 					  &transdatums, NULL, &ndatums);
 	if (ndatums != 2)
 		elog(ERROR, "expected 2-element interval array");
@@ -3524,7 +3499,7 @@ interval_accum_inv(PG_FUNCTION_ARGS)
 	transdatums[1] = IntervalPGetDatum(&N);
 
 	result = construct_array(transdatums, 2,
-							 INTERVALOID, sizeof(Interval), false, TYPALIGN_DOUBLE);
+							 INTERVALOID, sizeof(Interval), false, 'd');
 
 	PG_RETURN_ARRAYTYPE_P(result);
 }
@@ -3539,7 +3514,7 @@ interval_avg(PG_FUNCTION_ARGS)
 				N;
 
 	deconstruct_array(transarray,
-					  INTERVALOID, sizeof(Interval), false, TYPALIGN_DOUBLE,
+					  INTERVALOID, sizeof(Interval), false, 'd',
 					  &transdatums, NULL, &ndatums);
 	if (ndatums != 2)
 		elog(ERROR, "expected 2-element interval array");
@@ -5180,15 +5155,8 @@ timestamp_timestamptz(PG_FUNCTION_ARGS)
 	PG_RETURN_TIMESTAMPTZ(timestamp2timestamptz(timestamp));
 }
 
-/*
- * Convert timestamp to timestamp with time zone.
- *
- * On overflow error is thrown if 'overflow' is NULL.  Otherwise, '*overflow'
- * is set to -1 (+1) when result value exceed lower (upper) boundary and zero
- * returned.
- */
-TimestampTz
-timestamp2timestamptz_opt_overflow(Timestamp timestamp, int *overflow)
+static TimestampTz
+timestamp2timestamptz(Timestamp timestamp)
 {
 	TimestampTz result;
 	struct pg_tm tt,
@@ -5197,45 +5165,23 @@ timestamp2timestamptz_opt_overflow(Timestamp timestamp, int *overflow)
 	int			tz;
 
 	if (TIMESTAMP_NOT_FINITE(timestamp))
-		return timestamp;
-
-	if (!timestamp2tm(timestamp, NULL, tm, &fsec, NULL, NULL))
+		result = timestamp;
+	else
 	{
+		if (timestamp2tm(timestamp, NULL, tm, &fsec, NULL, NULL) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("timestamp out of range")));
+
 		tz = DetermineTimeZoneOffset(tm, session_timezone);
 
-		result = dt2local(timestamp, -tz);
-
-		if (IS_VALID_TIMESTAMP(result))
-		{
-			return result;
-		}
-		else if (overflow)
-		{
-			if (result < MIN_TIMESTAMP)
-				*overflow = -1;
-			else
-			{
-				Assert(result >= END_TIMESTAMP);
-				*overflow = 1;
-			}
-			return (TimestampTz) 0;
-		}
+		if (tm2timestamp(tm, fsec, &tz, &result) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("timestamp out of range")));
 	}
 
-	ereport(ERROR,
-			(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-			 errmsg("timestamp out of range")));
-
-	return 0;
-}
-
-/*
- * Single-argument version of timestamp2timestamptz_opt_overflow().
- */
-static TimestampTz
-timestamp2timestamptz(Timestamp timestamp)
-{
-	return timestamp2timestamptz_opt_overflow(timestamp, NULL);
+	return result;
 }
 
 /* timestamptz_timestamp()
@@ -5461,7 +5407,8 @@ generate_series_timestamp(PG_FUNCTION_ARGS)
 		timestamp_cmp_internal(result, fctx->finish) >= 0)
 	{
 		/* increment current in preparation for next iteration */
-		fctx->current = DatumGetTimestamp(DirectFunctionCall2(timestamp_pl_interval,
+		fctx->current = DatumGetTimestamp(
+										  DirectFunctionCall2(timestamp_pl_interval,
 															  TimestampGetDatum(fctx->current),
 															  PointerGetDatum(&fctx->step)));
 
@@ -5541,7 +5488,8 @@ generate_series_timestamptz(PG_FUNCTION_ARGS)
 		timestamp_cmp_internal(result, fctx->finish) >= 0)
 	{
 		/* increment current in preparation for next iteration */
-		fctx->current = DatumGetTimestampTz(DirectFunctionCall2(timestamptz_pl_interval,
+		fctx->current = DatumGetTimestampTz(
+											DirectFunctionCall2(timestamptz_pl_interval,
 																TimestampTzGetDatum(fctx->current),
 																PointerGetDatum(&fctx->step)));
 

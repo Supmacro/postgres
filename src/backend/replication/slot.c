@@ -4,7 +4,7 @@
  *	   Replication slot management.
  *
  *
- * Copyright (c) 2012-2020, PostgreSQL Global Development Group
+ * Copyright (c) 2012-2019, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -108,7 +108,7 @@ static void CreateSlotOnDisk(ReplicationSlot *slot);
 static void SaveSlotToPath(ReplicationSlot *slot, const char *path, int elevel);
 
 /*
- * Report shared-memory space needed by ReplicationSlotsShmemInit.
+ * Report shared-memory space needed by ReplicationSlotShmemInit.
  */
 Size
 ReplicationSlotsShmemSize(void)
@@ -140,6 +140,9 @@ ReplicationSlotsShmemInit(void)
 		ShmemInitStruct("ReplicationSlot Ctl", ReplicationSlotsShmemSize(),
 						&found);
 
+	LWLockRegisterTranche(LWTRANCHE_REPLICATION_SLOT_IO_IN_PROGRESS,
+						  "replication_slot_io");
+
 	if (!found)
 	{
 		int			i;
@@ -153,8 +156,7 @@ ReplicationSlotsShmemInit(void)
 
 			/* everything else is zeroed by the memset above */
 			SpinLockInit(&slot->mutex);
-			LWLockInitialize(&slot->io_in_progress_lock,
-							 LWTRANCHE_REPLICATION_SLOT_IO);
+			LWLockInitialize(&slot->io_in_progress_lock, LWTRANCHE_REPLICATION_SLOT_IO_IN_PROGRESS);
 			ConditionVariableInit(&slot->active_cv);
 		}
 	}
@@ -296,7 +298,7 @@ ReplicationSlotCreate(const char *name, bool db_specific,
 	 * We need to briefly prevent any other backend from iterating over the
 	 * slots while we flip the in_use flag. We also need to set the active
 	 * flag while holding the ControlLock as otherwise a concurrent
-	 * ReplicationSlotAcquire() could acquire the slot as well.
+	 * SlotAcquire() could acquire the slot as well.
 	 */
 	LWLockAcquire(ReplicationSlotControlLock, LW_EXCLUSIVE);
 
@@ -323,15 +325,9 @@ ReplicationSlotCreate(const char *name, bool db_specific,
 
 /*
  * Find a previously created slot and mark it as used by this backend.
- *
- * The return value is only useful if behavior is SAB_Inquire, in which
- * it's zero if we successfully acquired the slot, or the PID of the
- * owning process otherwise.  If behavior is SAB_Error, then trying to
- * acquire an owned slot is an error.  If SAB_Block, we sleep until the
- * slot is released by the owning process.
  */
-int
-ReplicationSlotAcquire(const char *name, SlotAcquireBehavior behavior)
+void
+ReplicationSlotAcquire(const char *name, bool nowait)
 {
 	ReplicationSlot *slot;
 	int			active_pid;
@@ -396,13 +392,11 @@ retry:
 	 */
 	if (active_pid != MyProcPid)
 	{
-		if (behavior == SAB_Error)
+		if (nowait)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_IN_USE),
 					 errmsg("replication slot \"%s\" is active for PID %d",
 							name, active_pid)));
-		else if (behavior == SAB_Inquire)
-			return active_pid;
 
 		/* Wait here until we get signaled, and then restart */
 		ConditionVariableSleep(&slot->active_cv,
@@ -418,9 +412,6 @@ retry:
 
 	/* We made this slot active, so it's ours now. */
 	MyReplicationSlot = slot;
-
-	/* success */
-	return 0;
 }
 
 /*
@@ -527,7 +518,7 @@ ReplicationSlotDrop(const char *name, bool nowait)
 {
 	Assert(MyReplicationSlot == NULL);
 
-	(void) ReplicationSlotAcquire(name, nowait ? SAB_Error : SAB_Block);
+	ReplicationSlotAcquire(name, nowait);
 
 	ReplicationSlotDropAcquired();
 }
@@ -752,10 +743,6 @@ ReplicationSlotsComputeRequiredXmin(bool already_locked)
 
 /*
  * Compute the oldest restart LSN across all slots and inform xlog module.
- *
- * Note: while max_slot_wal_keep_size is theoretically relevant for this
- * purpose, we don't try to account for that, because this module doesn't
- * know what to compare against.
  */
 void
 ReplicationSlotsComputeRequiredLSN(void)
@@ -830,9 +817,6 @@ ReplicationSlotsComputeLogicalRestartLSN(void)
 		SpinLockAcquire(&s->mutex);
 		restart_lsn = s->data.restart_lsn;
 		SpinLockRelease(&s->mutex);
-
-		if (restart_lsn == InvalidXLogRecPtr)
-			continue;
 
 		if (result == InvalidXLogRecPtr ||
 			restart_lsn < result)
@@ -995,7 +979,7 @@ CheckSlotRequirements(void)
 	if (max_replication_slots == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("replication slots can only be used if max_replication_slots > 0")));
+				 (errmsg("replication slots can only be used if max_replication_slots > 0"))));
 
 	if (wal_level < WAL_LEVEL_REPLICA)
 		ereport(ERROR,
@@ -1078,80 +1062,6 @@ ReplicationSlotReserveWal(void)
 		if (XLogGetLastRemovedSegno() < segno)
 			break;
 	}
-}
-
-/*
- * Mark any slot that points to an LSN older than the given segment
- * as invalid; it requires WAL that's about to be removed.
- *
- * NB - this runs as part of checkpoint, so avoid raising errors if possible.
- */
-void
-InvalidateObsoleteReplicationSlots(XLogSegNo oldestSegno)
-{
-	XLogRecPtr	oldestLSN;
-
-	XLogSegNoOffsetToRecPtr(oldestSegno, 0, wal_segment_size, oldestLSN);
-
-restart:
-	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
-	for (int i = 0; i < max_replication_slots; i++)
-	{
-		ReplicationSlot *s = &ReplicationSlotCtl->replication_slots[i];
-		XLogRecPtr	restart_lsn = InvalidXLogRecPtr;
-		char	   *slotname;
-
-		if (!s->in_use)
-			continue;
-
-		SpinLockAcquire(&s->mutex);
-		if (s->data.restart_lsn == InvalidXLogRecPtr ||
-			s->data.restart_lsn >= oldestLSN)
-		{
-			SpinLockRelease(&s->mutex);
-			continue;
-		}
-
-		slotname = pstrdup(NameStr(s->data.name));
-		restart_lsn = s->data.restart_lsn;
-
-		SpinLockRelease(&s->mutex);
-		LWLockRelease(ReplicationSlotControlLock);
-
-		for (;;)
-		{
-			int			wspid = ReplicationSlotAcquire(slotname, SAB_Inquire);
-
-			/* no walsender? success! */
-			if (wspid == 0)
-				break;
-
-			ereport(LOG,
-					(errmsg("terminating walsender %d because replication slot \"%s\" is too far behind",
-							wspid, slotname)));
-			(void) kill(wspid, SIGTERM);
-
-			ConditionVariableTimedSleep(&s->active_cv, 10,
-										WAIT_EVENT_REPLICATION_SLOT_DROP);
-		}
-		ConditionVariableCancelSleep();
-
-		ereport(LOG,
-				(errmsg("invalidating slot \"%s\" because its restart_lsn %X/%X exceeds max_slot_wal_keep_size",
-						slotname,
-						(uint32) (restart_lsn >> 32),
-						(uint32) restart_lsn)));
-
-		SpinLockAcquire(&s->mutex);
-		s->data.restart_lsn = InvalidXLogRecPtr;
-		SpinLockRelease(&s->mutex);
-		ReplicationSlotRelease();
-
-		/* if we did anything, start from scratch */
-		CHECK_FOR_INTERRUPTS();
-		goto restart;
-	}
-	LWLockRelease(ReplicationSlotControlLock);
 }
 
 /*
@@ -1417,7 +1327,7 @@ SaveSlotToPath(ReplicationSlot *slot, const char *dir, int elevel)
 	}
 	pgstat_report_wait_end();
 
-	if (CloseTransientFile(fd) != 0)
+	if (CloseTransientFile(fd))
 	{
 		int			save_errno = errno;
 
@@ -1583,7 +1493,7 @@ RestoreSlotFromDisk(const char *name)
 							path, readBytes, (Size) cp.length)));
 	}
 
-	if (CloseTransientFile(fd) != 0)
+	if (CloseTransientFile(fd))
 		ereport(PANIC,
 				(errcode_for_file_access(),
 				 errmsg("could not close file \"%s\": %m", path)));

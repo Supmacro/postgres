@@ -45,12 +45,16 @@
 #include <termios.h>
 #endif
 
-#include "dumputils.h"
 #include "getopt_long.h"
+
+#include "dumputils.h"
 #include "parallel.h"
 #include "pg_backup_utils.h"
 
+
 static void usage(const char *progname);
+
+typedef struct option optType;
 
 int
 main(int argc, char **argv)
@@ -519,6 +523,5 @@ usage(const char *progname)
 			 "The options -I, -n, -N, -P, -t, -T, and --section can be combined and specified\n"
 			 "multiple times to select multiple objects.\n"));
 	printf(_("\nIf no input file name is supplied, then standard input is used.\n\n"));
-	printf(_("Report bugs to <%s>.\n"), PACKAGE_BUGREPORT);
-	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
+	printf(_("Report bugs to <pgsql-bugs@lists.postgresql.org>.\n"));
 }

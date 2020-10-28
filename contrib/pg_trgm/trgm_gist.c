@@ -3,22 +3,12 @@
  */
 #include "postgres.h"
 
-#include "access/reloptions.h"
+#include "trgm.h"
+
 #include "access/stratnum.h"
 #include "fmgr.h"
 #include "port/pg_bitutils.h"
-#include "trgm.h"
 
-/* gist_trgm_ops opclass options */
-typedef struct
-{
-	int32		vl_len_;		/* varlena header (do not touch directly!) */
-	int			siglen;			/* signature length in bytes */
-} TrgmGistOptions;
-
-#define LTREE_GET_ASIGLEN()		(PG_HAS_OPCLASS_OPTIONS() ? \
-								 ((TrgmGistOptions *) PG_GET_OPCLASS_OPTIONS())->siglen : \
-								 SIGLEN_DEFAULT)
 
 typedef struct
 {
@@ -49,7 +39,6 @@ PG_FUNCTION_INFO_V1(gtrgm_union);
 PG_FUNCTION_INFO_V1(gtrgm_same);
 PG_FUNCTION_INFO_V1(gtrgm_penalty);
 PG_FUNCTION_INFO_V1(gtrgm_picksplit);
-PG_FUNCTION_INFO_V1(gtrgm_options);
 
 
 Datum
@@ -66,41 +55,20 @@ gtrgm_out(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(0);
 }
 
-static TRGM *
-gtrgm_alloc(bool isalltrue, int siglen, BITVECP sign)
-{
-	int			flag = SIGNKEY | (isalltrue ? ALLISTRUE : 0);
-	int			size = CALCGTSIZE(flag, siglen);
-	TRGM	   *res = palloc(size);
-
-	SET_VARSIZE(res, size);
-	res->flag = flag;
-
-	if (!isalltrue)
-	{
-		if (sign)
-			memcpy(GETSIGN(res), sign, siglen);
-		else
-			memset(GETSIGN(res), 0, siglen);
-	}
-
-	return res;
-}
-
 static void
-makesign(BITVECP sign, TRGM *a, int siglen)
+makesign(BITVECP sign, TRGM *a)
 {
 	int32		k,
 				len = ARRNELEM(a);
 	trgm	   *ptr = GETARR(a);
 	int32		tmp = 0;
 
-	MemSet((void *) sign, 0, siglen);
-	SETBIT(sign, SIGLENBIT(siglen));	/* set last unused bit */
+	MemSet((void *) sign, 0, sizeof(BITVEC));
+	SETBIT(sign, SIGLENBIT);	/* set last unused bit */
 	for (k = 0; k < len; k++)
 	{
 		CPTRGM(((char *) &tmp), ptr + k);
-		HASH(sign, tmp, siglen);
+		HASH(sign, tmp);
 	}
 }
 
@@ -108,7 +76,6 @@ Datum
 gtrgm_compress(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
-	int			siglen = LTREE_GET_ASIGLEN();
 	GISTENTRY  *retval = entry;
 
 	if (entry->leafkey)
@@ -125,17 +92,22 @@ gtrgm_compress(PG_FUNCTION_ARGS)
 	else if (ISSIGNKEY(DatumGetPointer(entry->key)) &&
 			 !ISALLTRUE(DatumGetPointer(entry->key)))
 	{
-		int32		i;
+		int32		i,
+					len;
 		TRGM	   *res;
 		BITVECP		sign = GETSIGN(DatumGetPointer(entry->key));
 
-		LOOPBYTE(siglen)
+		LOOPBYTE
 		{
 			if ((sign[i] & 0xff) != 0xff)
 				PG_RETURN_POINTER(retval);
 		}
 
-		res = gtrgm_alloc(true, siglen, sign);
+		len = CALCGTSIZE(SIGNKEY | ALLISTRUE, 0);
+		res = (TRGM *) palloc(len);
+		SET_VARSIZE(res, len);
+		res->flag = SIGNKEY | ALLISTRUE;
+
 		retval = (GISTENTRY *) palloc(sizeof(GISTENTRY));
 		gistentryinit(*retval, PointerGetDatum(res),
 					  entry->rel, entry->page,
@@ -169,7 +141,7 @@ gtrgm_decompress(PG_FUNCTION_ARGS)
 }
 
 static int32
-cnt_sml_sign_common(TRGM *qtrg, BITVECP sign, int siglen)
+cnt_sml_sign_common(TRGM *qtrg, BITVECP sign)
 {
 	int32		count = 0;
 	int32		k,
@@ -180,7 +152,7 @@ cnt_sml_sign_common(TRGM *qtrg, BITVECP sign, int siglen)
 	for (k = 0; k < len; k++)
 	{
 		CPTRGM(((char *) &tmp), ptr + k);
-		count += GETBIT(sign, HASHVAL(tmp, siglen));
+		count += GETBIT(sign, HASHVAL(tmp));
 	}
 
 	return count;
@@ -195,7 +167,6 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 
 	/* Oid		subtype = PG_GETARG_OID(3); */
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
-	int			siglen = LTREE_GET_ASIGLEN();
 	TRGM	   *key = (TRGM *) DatumGetPointer(entry->key);
 	TRGM	   *qtrg;
 	bool		res;
@@ -323,7 +294,7 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 			}
 			else
 			{					/* non-leaf contains signature */
-				int32		count = cnt_sml_sign_common(qtrg, GETSIGN(key), siglen);
+				int32		count = cnt_sml_sign_common(qtrg, GETSIGN(key));
 				int32		len = ARRNELEM(qtrg);
 
 				if (len == 0)
@@ -365,7 +336,7 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 				for (k = 0; k < len; k++)
 				{
 					CPTRGM(((char *) &tmp), ptr + k);
-					if (!GETBIT(sign, HASHVAL(tmp, siglen)))
+					if (!GETBIT(sign, HASHVAL(tmp)))
 					{
 						res = false;
 						break;
@@ -418,7 +389,7 @@ gtrgm_consistent(PG_FUNCTION_ARGS)
 					for (k = 0; k < len; k++)
 					{
 						CPTRGM(((char *) &tmp), ptr + k);
-						check[k] = GETBIT(sign, HASHVAL(tmp, siglen));
+						check[k] = GETBIT(sign, HASHVAL(tmp));
 					}
 					res = trigramsMatchGraph(cache->graph, check);
 					pfree(check);
@@ -448,7 +419,6 @@ gtrgm_distance(PG_FUNCTION_ARGS)
 
 	/* Oid		subtype = PG_GETARG_OID(3); */
 	bool	   *recheck = (bool *) PG_GETARG_POINTER(4);
-	int			siglen = LTREE_GET_ASIGLEN();
 	TRGM	   *key = (TRGM *) DatumGetPointer(entry->key);
 	TRGM	   *qtrg;
 	float8		res;
@@ -506,7 +476,7 @@ gtrgm_distance(PG_FUNCTION_ARGS)
 			}
 			else
 			{					/* non-leaf contains signature */
-				int32		count = cnt_sml_sign_common(qtrg, GETSIGN(key), siglen);
+				int32		count = cnt_sml_sign_common(qtrg, GETSIGN(key));
 				int32		len = ARRNELEM(qtrg);
 
 				res = (len == 0) ? -1.0 : 1.0 - ((float8) count) / ((float8) len);
@@ -522,7 +492,7 @@ gtrgm_distance(PG_FUNCTION_ARGS)
 }
 
 static int32
-unionkey(BITVECP sbase, TRGM *add, int siglen)
+unionkey(BITVECP sbase, TRGM *add)
 {
 	int32		i;
 
@@ -533,7 +503,7 @@ unionkey(BITVECP sbase, TRGM *add, int siglen)
 		if (ISALLTRUE(add))
 			return 1;
 
-		LOOPBYTE(siglen)
+		LOOPBYTE
 			sbase[i] |= sadd[i];
 	}
 	else
@@ -544,7 +514,7 @@ unionkey(BITVECP sbase, TRGM *add, int siglen)
 		for (i = 0; i < ARRNELEM(add); i++)
 		{
 			CPTRGM(((char *) &tmp), ptr + i);
-			HASH(sbase, tmp, siglen);
+			HASH(sbase, tmp);
 		}
 	}
 	return 0;
@@ -557,22 +527,29 @@ gtrgm_union(PG_FUNCTION_ARGS)
 	GistEntryVector *entryvec = (GistEntryVector *) PG_GETARG_POINTER(0);
 	int32		len = entryvec->n;
 	int		   *size = (int *) PG_GETARG_POINTER(1);
-	int			siglen = LTREE_GET_ASIGLEN();
+	BITVEC		base;
 	int32		i;
-	TRGM	   *result = gtrgm_alloc(false, siglen, NULL);
-	BITVECP		base = GETSIGN(result);
+	int32		flag = 0;
+	TRGM	   *result;
 
+	MemSet((void *) base, 0, sizeof(BITVEC));
 	for (i = 0; i < len; i++)
 	{
-		if (unionkey(base, GETENTRY(entryvec, i), siglen))
+		if (unionkey(base, GETENTRY(entryvec, i)))
 		{
-			result->flag = ALLISTRUE;
-			SET_VARSIZE(result, CALCGTSIZE(ALLISTRUE, siglen));
+			flag = ALLISTRUE;
 			break;
 		}
 	}
 
-	*size = VARSIZE(result);
+	flag |= SIGNKEY;
+	len = CALCGTSIZE(flag, 0);
+	result = (TRGM *) palloc(len);
+	SET_VARSIZE(result, len);
+	result->flag = flag;
+	if (!ISALLTRUE(result))
+		memcpy((void *) GETSIGN(result), (void *) base, sizeof(BITVEC));
+	*size = len;
 
 	PG_RETURN_POINTER(result);
 }
@@ -583,7 +560,6 @@ gtrgm_same(PG_FUNCTION_ARGS)
 	TRGM	   *a = (TRGM *) PG_GETARG_POINTER(0);
 	TRGM	   *b = (TRGM *) PG_GETARG_POINTER(1);
 	bool	   *result = (bool *) PG_GETARG_POINTER(2);
-	int			siglen = LTREE_GET_ASIGLEN();
 
 	if (ISSIGNKEY(a))
 	{							/* then b also ISSIGNKEY */
@@ -600,7 +576,7 @@ gtrgm_same(PG_FUNCTION_ARGS)
 						sb = GETSIGN(b);
 
 			*result = true;
-			LOOPBYTE(siglen)
+			LOOPBYTE
 			{
 				if (sa[i] != sb[i])
 				{
@@ -637,19 +613,19 @@ gtrgm_same(PG_FUNCTION_ARGS)
 }
 
 static int32
-sizebitvec(BITVECP sign, int siglen)
+sizebitvec(BITVECP sign)
 {
-	return pg_popcount(sign, siglen);
+	return pg_popcount(sign, SIGLEN);
 }
 
 static int
-hemdistsign(BITVECP a, BITVECP b, int siglen)
+hemdistsign(BITVECP a, BITVECP b)
 {
 	int			i,
 				diff,
 				dist = 0;
 
-	LOOPBYTE(siglen)
+	LOOPBYTE
 	{
 		diff = (unsigned char) (a[i] ^ b[i]);
 		/* Using the popcount functions here isn't likely to win */
@@ -659,19 +635,19 @@ hemdistsign(BITVECP a, BITVECP b, int siglen)
 }
 
 static int
-hemdist(TRGM *a, TRGM *b, int siglen)
+hemdist(TRGM *a, TRGM *b)
 {
 	if (ISALLTRUE(a))
 	{
 		if (ISALLTRUE(b))
 			return 0;
 		else
-			return SIGLENBIT(siglen) - sizebitvec(GETSIGN(b), siglen);
+			return SIGLENBIT - sizebitvec(GETSIGN(b));
 	}
 	else if (ISALLTRUE(b))
-		return SIGLENBIT(siglen) - sizebitvec(GETSIGN(a), siglen);
+		return SIGLENBIT - sizebitvec(GETSIGN(a));
 
-	return hemdistsign(GETSIGN(a), GETSIGN(b), siglen);
+	return hemdistsign(GETSIGN(a), GETSIGN(b));
 }
 
 Datum
@@ -680,7 +656,6 @@ gtrgm_penalty(PG_FUNCTION_ARGS)
 	GISTENTRY  *origentry = (GISTENTRY *) PG_GETARG_POINTER(0); /* always ISSIGNKEY */
 	GISTENTRY  *newentry = (GISTENTRY *) PG_GETARG_POINTER(1);
 	float	   *penalty = (float *) PG_GETARG_POINTER(2);
-	int			siglen = LTREE_GET_ASIGLEN();
 	TRGM	   *origval = (TRGM *) DatumGetPointer(origentry->key);
 	TRGM	   *newval = (TRGM *) DatumGetPointer(newentry->key);
 	BITVECP		orig = GETSIGN(origval);
@@ -690,7 +665,7 @@ gtrgm_penalty(PG_FUNCTION_ARGS)
 	if (ISARRKEY(newval))
 	{
 		char	   *cache = (char *) fcinfo->flinfo->fn_extra;
-		TRGM	   *cachedVal = (TRGM *) (cache + MAXALIGN(siglen));
+		TRGM	   *cachedVal = (TRGM *) (cache + MAXALIGN(sizeof(BITVEC)));
 		Size		newvalsize = VARSIZE(newval);
 		BITVECP		sign;
 
@@ -704,12 +679,12 @@ gtrgm_penalty(PG_FUNCTION_ARGS)
 			char	   *newcache;
 
 			newcache = MemoryContextAlloc(fcinfo->flinfo->fn_mcxt,
-										  MAXALIGN(siglen) +
+										  MAXALIGN(sizeof(BITVEC)) +
 										  newvalsize);
 
-			makesign((BITVECP) newcache, newval, siglen);
+			makesign((BITVECP) newcache, newval);
 
-			cachedVal = (TRGM *) (newcache + MAXALIGN(siglen));
+			cachedVal = (TRGM *) (newcache + MAXALIGN(sizeof(BITVEC)));
 			memcpy(cachedVal, newval, newvalsize);
 
 			if (cache)
@@ -721,32 +696,31 @@ gtrgm_penalty(PG_FUNCTION_ARGS)
 		sign = (BITVECP) cache;
 
 		if (ISALLTRUE(origval))
-			*penalty = ((float) (SIGLENBIT(siglen) - sizebitvec(sign, siglen))) / (float) (SIGLENBIT(siglen) + 1);
+			*penalty = ((float) (SIGLENBIT - sizebitvec(sign))) / (float) (SIGLENBIT + 1);
 		else
-			*penalty = hemdistsign(sign, orig, siglen);
+			*penalty = hemdistsign(sign, orig);
 	}
 	else
-		*penalty = hemdist(origval, newval, siglen);
+		*penalty = hemdist(origval, newval);
 	PG_RETURN_POINTER(penalty);
 }
 
 typedef struct
 {
 	bool		allistrue;
-	BITVECP		sign;
+	BITVEC		sign;
 } CACHESIGN;
 
 static void
-fillcache(CACHESIGN *item, TRGM *key, BITVECP sign, int siglen)
+fillcache(CACHESIGN *item, TRGM *key)
 {
 	item->allistrue = false;
-	item->sign = sign;
 	if (ISARRKEY(key))
-		makesign(item->sign, key, siglen);
+		makesign(item->sign, key);
 	else if (ISALLTRUE(key))
 		item->allistrue = true;
 	else
-		memcpy((void *) item->sign, (void *) GETSIGN(key), siglen);
+		memcpy((void *) item->sign, (void *) GETSIGN(key), sizeof(BITVEC));
 }
 
 #define WISH_F(a,b,c) (double)( -(double)(((a)-(b))*((a)-(b))*((a)-(b)))*(c) )
@@ -767,19 +741,19 @@ comparecost(const void *a, const void *b)
 
 
 static int
-hemdistcache(CACHESIGN *a, CACHESIGN *b, int siglen)
+hemdistcache(CACHESIGN *a, CACHESIGN *b)
 {
 	if (a->allistrue)
 	{
 		if (b->allistrue)
 			return 0;
 		else
-			return SIGLENBIT(siglen) - sizebitvec(b->sign, siglen);
+			return SIGLENBIT - sizebitvec(b->sign);
 	}
 	else if (b->allistrue)
-		return SIGLENBIT(siglen) - sizebitvec(a->sign, siglen);
+		return SIGLENBIT - sizebitvec(a->sign);
 
-	return hemdistsign(a->sign, b->sign, siglen);
+	return hemdistsign(a->sign, b->sign);
 }
 
 Datum
@@ -788,7 +762,6 @@ gtrgm_picksplit(PG_FUNCTION_ARGS)
 	GistEntryVector *entryvec = (GistEntryVector *) PG_GETARG_POINTER(0);
 	OffsetNumber maxoff = entryvec->n - 2;
 	GIST_SPLITVEC *v = (GIST_SPLITVEC *) PG_GETARG_POINTER(1);
-	int			siglen = LTREE_GET_ASIGLEN();
 	OffsetNumber k,
 				j;
 	TRGM	   *datum_l,
@@ -807,23 +780,19 @@ gtrgm_picksplit(PG_FUNCTION_ARGS)
 	BITVECP		ptr;
 	int			i;
 	CACHESIGN  *cache;
-	char	   *cache_sign;
 	SPLITCOST  *costvector;
 
 	/* cache the sign data for each existing item */
 	cache = (CACHESIGN *) palloc(sizeof(CACHESIGN) * (maxoff + 2));
-	cache_sign = palloc(siglen * (maxoff + 2));
-
 	for (k = FirstOffsetNumber; k <= maxoff; k = OffsetNumberNext(k))
-		fillcache(&cache[k], GETENTRY(entryvec, k), &cache_sign[siglen * k],
-				  siglen);
+		fillcache(&cache[k], GETENTRY(entryvec, k));
 
 	/* now find the two furthest-apart items */
 	for (k = FirstOffsetNumber; k < maxoff; k = OffsetNumberNext(k))
 	{
 		for (j = OffsetNumberNext(k); j <= maxoff; j = OffsetNumberNext(j))
 		{
-			size_waste = hemdistcache(&(cache[j]), &(cache[k]), siglen);
+			size_waste = hemdistcache(&(cache[j]), &(cache[k]));
 			if (size_waste > waste)
 			{
 				waste = size_waste;
@@ -848,22 +817,44 @@ gtrgm_picksplit(PG_FUNCTION_ARGS)
 	v->spl_nright = 0;
 
 	/* form initial .. */
-	datum_l = gtrgm_alloc(cache[seed_1].allistrue, siglen, cache[seed_1].sign);
-	datum_r = gtrgm_alloc(cache[seed_2].allistrue, siglen, cache[seed_2].sign);
+	if (cache[seed_1].allistrue)
+	{
+		datum_l = (TRGM *) palloc(CALCGTSIZE(SIGNKEY | ALLISTRUE, 0));
+		SET_VARSIZE(datum_l, CALCGTSIZE(SIGNKEY | ALLISTRUE, 0));
+		datum_l->flag = SIGNKEY | ALLISTRUE;
+	}
+	else
+	{
+		datum_l = (TRGM *) palloc(CALCGTSIZE(SIGNKEY, 0));
+		SET_VARSIZE(datum_l, CALCGTSIZE(SIGNKEY, 0));
+		datum_l->flag = SIGNKEY;
+		memcpy((void *) GETSIGN(datum_l), (void *) cache[seed_1].sign, sizeof(BITVEC));
+	}
+	if (cache[seed_2].allistrue)
+	{
+		datum_r = (TRGM *) palloc(CALCGTSIZE(SIGNKEY | ALLISTRUE, 0));
+		SET_VARSIZE(datum_r, CALCGTSIZE(SIGNKEY | ALLISTRUE, 0));
+		datum_r->flag = SIGNKEY | ALLISTRUE;
+	}
+	else
+	{
+		datum_r = (TRGM *) palloc(CALCGTSIZE(SIGNKEY, 0));
+		SET_VARSIZE(datum_r, CALCGTSIZE(SIGNKEY, 0));
+		datum_r->flag = SIGNKEY;
+		memcpy((void *) GETSIGN(datum_r), (void *) cache[seed_2].sign, sizeof(BITVEC));
+	}
 
 	union_l = GETSIGN(datum_l);
 	union_r = GETSIGN(datum_r);
 	maxoff = OffsetNumberNext(maxoff);
-	fillcache(&cache[maxoff], GETENTRY(entryvec, maxoff),
-			  &cache_sign[siglen * maxoff], siglen);
-
+	fillcache(&cache[maxoff], GETENTRY(entryvec, maxoff));
 	/* sort before ... */
 	costvector = (SPLITCOST *) palloc(sizeof(SPLITCOST) * maxoff);
 	for (j = FirstOffsetNumber; j <= maxoff; j = OffsetNumberNext(j))
 	{
 		costvector[j - 1].pos = j;
-		size_alpha = hemdistcache(&(cache[seed_1]), &(cache[j]), siglen);
-		size_beta = hemdistcache(&(cache[seed_2]), &(cache[j]), siglen);
+		size_alpha = hemdistcache(&(cache[seed_1]), &(cache[j]));
+		size_beta = hemdistcache(&(cache[seed_2]), &(cache[j]));
 		costvector[j - 1].cost = abs(size_alpha - size_beta);
 	}
 	qsort((void *) costvector, maxoff, sizeof(SPLITCOST), comparecost);
@@ -889,38 +880,36 @@ gtrgm_picksplit(PG_FUNCTION_ARGS)
 			if (ISALLTRUE(datum_l) && cache[j].allistrue)
 				size_alpha = 0;
 			else
-				size_alpha = SIGLENBIT(siglen) -
-					sizebitvec((cache[j].allistrue) ? GETSIGN(datum_l) :
-							   GETSIGN(cache[j].sign),
-							   siglen);
+				size_alpha = SIGLENBIT - sizebitvec(
+													(cache[j].allistrue) ? GETSIGN(datum_l) : GETSIGN(cache[j].sign)
+					);
 		}
 		else
-			size_alpha = hemdistsign(cache[j].sign, GETSIGN(datum_l), siglen);
+			size_alpha = hemdistsign(cache[j].sign, GETSIGN(datum_l));
 
 		if (ISALLTRUE(datum_r) || cache[j].allistrue)
 		{
 			if (ISALLTRUE(datum_r) && cache[j].allistrue)
 				size_beta = 0;
 			else
-				size_beta = SIGLENBIT(siglen) -
-					sizebitvec((cache[j].allistrue) ? GETSIGN(datum_r) :
-							   GETSIGN(cache[j].sign),
-							   siglen);
+				size_beta = SIGLENBIT - sizebitvec(
+												   (cache[j].allistrue) ? GETSIGN(datum_r) : GETSIGN(cache[j].sign)
+					);
 		}
 		else
-			size_beta = hemdistsign(cache[j].sign, GETSIGN(datum_r), siglen);
+			size_beta = hemdistsign(cache[j].sign, GETSIGN(datum_r));
 
 		if (size_alpha < size_beta + WISH_F(v->spl_nleft, v->spl_nright, 0.1))
 		{
 			if (ISALLTRUE(datum_l) || cache[j].allistrue)
 			{
 				if (!ISALLTRUE(datum_l))
-					MemSet((void *) GETSIGN(datum_l), 0xff, siglen);
+					MemSet((void *) GETSIGN(datum_l), 0xff, sizeof(BITVEC));
 			}
 			else
 			{
 				ptr = cache[j].sign;
-				LOOPBYTE(siglen)
+				LOOPBYTE
 					union_l[i] |= ptr[i];
 			}
 			*left++ = j;
@@ -931,12 +920,12 @@ gtrgm_picksplit(PG_FUNCTION_ARGS)
 			if (ISALLTRUE(datum_r) || cache[j].allistrue)
 			{
 				if (!ISALLTRUE(datum_r))
-					MemSet((void *) GETSIGN(datum_r), 0xff, siglen);
+					MemSet((void *) GETSIGN(datum_r), 0xff, sizeof(BITVEC));
 			}
 			else
 			{
 				ptr = cache[j].sign;
-				LOOPBYTE(siglen)
+				LOOPBYTE
 					union_r[i] |= ptr[i];
 			}
 			*right++ = j;
@@ -949,18 +938,4 @@ gtrgm_picksplit(PG_FUNCTION_ARGS)
 	v->spl_rdatum = PointerGetDatum(datum_r);
 
 	PG_RETURN_POINTER(v);
-}
-
-Datum
-gtrgm_options(PG_FUNCTION_ARGS)
-{
-	local_relopts *relopts = (local_relopts *) PG_GETARG_POINTER(0);
-
-	init_local_reloptions(relopts, sizeof(TrgmGistOptions));
-	add_local_int_reloption(relopts, "siglen",
-							"signature length in bytes",
-							SIGLEN_DEFAULT, 1, SIGLEN_MAX,
-							offsetof(TrgmGistOptions, siglen));
-
-	PG_RETURN_VOID();
 }

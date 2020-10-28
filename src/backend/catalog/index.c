@@ -3,7 +3,7 @@
  * index.c
  *	  code to create and destroy POSTGRES index relations
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -26,7 +26,6 @@
 #include "access/amapi.h"
 #include "access/heapam.h"
 #include "access/multixact.h"
-#include "access/reloptions.h"
 #include "access/relscan.h"
 #include "access/sysattr.h"
 #include "access/tableam.h"
@@ -44,11 +43,11 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
-#include "catalog/pg_depend.h"
 #include "catalog/pg_description.h"
+#include "catalog/pg_depend.h"
 #include "catalog/pg_inherits.h"
-#include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
+#include "catalog/pg_opclass.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type.h"
@@ -77,9 +76,10 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
-#include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/tuplesort.h"
+#include "utils/snapmgr.h"
+
 
 /* Potentially set by pg_upgrade_support functions */
 Oid			binary_upgrade_next_index_pg_class_oid = InvalidOid;
@@ -106,8 +106,7 @@ static TupleDesc ConstructTupleDescriptor(Relation heapRelation,
 										  Oid *classObjectId);
 static void InitializeAttributeOids(Relation indexRelation,
 									int numatts, Oid indexoid);
-static void AppendAttributeTuples(Relation indexRelation, int numatts,
-								  Datum *attopts);
+static void AppendAttributeTuples(Relation indexRelation, int numatts);
 static void UpdateIndexRelation(Oid indexoid, Oid heapoid,
 								Oid parentIndexId,
 								IndexInfo *indexInfo,
@@ -319,7 +318,7 @@ ConstructTupleDescriptor(Relation heapRelation,
 		if (colnames_item == NULL)	/* shouldn't happen */
 			elog(ERROR, "too few entries in colnames list");
 		namestrcpy(&to->attname, (const char *) lfirst(colnames_item));
-		colnames_item = lnext(indexColNames, colnames_item);
+		colnames_item = lnext(colnames_item);
 
 		/*
 		 * For simple index columns, we copy some pg_attribute fields from the
@@ -354,7 +353,7 @@ ConstructTupleDescriptor(Relation heapRelation,
 			if (indexpr_item == NULL)	/* shouldn't happen */
 				elog(ERROR, "too few entries in indexprs list");
 			indexkey = (Node *) lfirst(indexpr_item);
-			indexpr_item = lnext(indexInfo->ii_Expressions, indexpr_item);
+			indexpr_item = lnext(indexpr_item);
 
 			/*
 			 * Lookup the expression type in pg_type for the type length etc.
@@ -405,6 +404,10 @@ ConstructTupleDescriptor(Relation heapRelation,
 		 */
 		keyType = amroutine->amkeytype;
 
+		/*
+		 * Code below is concerned to the opclasses which are not used with
+		 * the included columns.
+		 */
 		if (i < indexInfo->ii_NumIndexKeyAttrs)
 		{
 			tuple = SearchSysCache1(CLAOID, ObjectIdGetDatum(classObjectId[i]));
@@ -419,10 +422,6 @@ ConstructTupleDescriptor(Relation heapRelation,
 			 * If keytype is specified as ANYELEMENT, and opcintype is
 			 * ANYARRAY, then the attribute type must be an array (else it'd
 			 * not have matched this opclass); use its element type.
-			 *
-			 * We could also allow ANYCOMPATIBLE/ANYCOMPATIBLEARRAY here, but
-			 * there seems no need to do so; there's no reason to declare an
-			 * opclass as taking ANYCOMPATIBLEARRAY rather than ANYARRAY.
 			 */
 			if (keyType == ANYELEMENTOID && opclassTup->opcintype == ANYARRAYOID)
 			{
@@ -485,7 +484,7 @@ InitializeAttributeOids(Relation indexRelation,
  * ----------------------------------------------------------------
  */
 static void
-AppendAttributeTuples(Relation indexRelation, int numatts, Datum *attopts)
+AppendAttributeTuples(Relation indexRelation, int numatts)
 {
 	Relation	pg_attribute;
 	CatalogIndexState indstate;
@@ -507,11 +506,10 @@ AppendAttributeTuples(Relation indexRelation, int numatts, Datum *attopts)
 	for (i = 0; i < numatts; i++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(indexTupDesc, i);
-		Datum		attoptions = attopts ? attopts[i] : (Datum) 0;
 
 		Assert(attr->attnum == i + 1);
 
-		InsertPgAttributeTuple(pg_attribute, attr, attoptions, indstate);
+		InsertPgAttributeTuple(pg_attribute, attr, indstate);
 	}
 
 	CatalogCloseIndexes(indstate);
@@ -590,7 +588,6 @@ UpdateIndexRelation(Oid indexoid,
 	}
 	else
 		predDatum = (Datum) 0;
-
 
 	/*
 	 * open the system catalog index relation
@@ -979,8 +976,7 @@ index_create(Relation heapRelation,
 	/*
 	 * append ATTRIBUTE tuples for the index
 	 */
-	AppendAttributeTuples(indexRelation, indexInfo->ii_NumIndexAttrs,
-						  indexInfo->ii_OpclassOptions);
+	AppendAttributeTuples(indexRelation, indexInfo->ii_NumIndexAttrs);
 
 	/* ----------------
 	 *	  update pg_index
@@ -1192,13 +1188,6 @@ index_create(Relation heapRelation,
 		Assert(indexRelation->rd_indexcxt != NULL);
 
 	indexRelation->rd_index->indnkeyatts = indexInfo->ii_NumIndexKeyAttrs;
-
-	/* Validate opclass-specific options */
-	if (indexInfo->ii_OpclassOptions)
-		for (i = 0; i < indexInfo->ii_NumIndexKeyAttrs; i++)
-			(void) index_opclass_options(indexRelation, i + 1,
-										 indexInfo->ii_OpclassOptions[i],
-										 true);
 
 	/*
 	 * If this is bootstrap (initdb) time, then we don't actually fill in the
@@ -1537,6 +1526,10 @@ index_concurrently_swap(Oid newIndexId, Oid oldIndexId, const char *oldName)
 	oldIndexForm->indisexclusion = false;
 	newIndexForm->indimmediate = oldIndexForm->indimmediate;
 	oldIndexForm->indimmediate = true;
+
+	/* Preserve indisreplident in the new index */
+	newIndexForm->indisreplident = oldIndexForm->indisreplident;
+	oldIndexForm->indisreplident = false;
 
 	/* Preserve indisclustered in the new index */
 	newIndexForm->indisclustered = oldIndexForm->indisclustered;
@@ -2310,7 +2303,7 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 IndexInfo *
 BuildIndexInfo(Relation index)
 {
-	IndexInfo  *ii;
+	IndexInfo  *ii = makeNode(IndexInfo);
 	Form_pg_index indexStruct = index->rd_index;
 	int			i;
 	int			numAtts;
@@ -2320,23 +2313,21 @@ BuildIndexInfo(Relation index)
 	if (numAtts < 1 || numAtts > INDEX_MAX_KEYS)
 		elog(ERROR, "invalid indnatts %d for index %u",
 			 numAtts, RelationGetRelid(index));
+	ii->ii_NumIndexAttrs = numAtts;
+	ii->ii_NumIndexKeyAttrs = indexStruct->indnkeyatts;
+	Assert(ii->ii_NumIndexKeyAttrs != 0);
+	Assert(ii->ii_NumIndexKeyAttrs <= ii->ii_NumIndexAttrs);
 
-	/*
-	 * Create the node, fetching any expressions needed for expressional
-	 * indexes and index predicate if any.
-	 */
-	ii = makeIndexInfo(indexStruct->indnatts,
-					   indexStruct->indnkeyatts,
-					   index->rd_rel->relam,
-					   RelationGetIndexExpressions(index),
-					   RelationGetIndexPredicate(index),
-					   indexStruct->indisunique,
-					   indexStruct->indisready,
-					   false);
-
-	/* fill in attribute numbers */
 	for (i = 0; i < numAtts; i++)
 		ii->ii_IndexAttrNumbers[i] = indexStruct->indkey.values[i];
+
+	/* fetch any expressions needed for expressional indexes */
+	ii->ii_Expressions = RelationGetIndexExpressions(index);
+	ii->ii_ExpressionsState = NIL;
+
+	/* fetch index predicate if any */
+	ii->ii_Predicate = RelationGetIndexPredicate(index);
+	ii->ii_PredicateState = NULL;
 
 	/* fetch exclusion constraint info if any */
 	if (indexStruct->indisexclusion)
@@ -2346,8 +2337,30 @@ BuildIndexInfo(Relation index)
 								 &ii->ii_ExclusionProcs,
 								 &ii->ii_ExclusionStrats);
 	}
+	else
+	{
+		ii->ii_ExclusionOps = NULL;
+		ii->ii_ExclusionProcs = NULL;
+		ii->ii_ExclusionStrats = NULL;
+	}
 
-	ii->ii_OpclassOptions = RelationGetIndexRawAttOptions(index);
+	/* other info */
+	ii->ii_Unique = indexStruct->indisunique;
+	ii->ii_ReadyForInserts = indexStruct->indisready;
+	/* assume not doing speculative insertion for now */
+	ii->ii_UniqueOps = NULL;
+	ii->ii_UniqueProcs = NULL;
+	ii->ii_UniqueStrats = NULL;
+
+	/* initialize index-build state to default */
+	ii->ii_Concurrent = false;
+	ii->ii_BrokenHotChain = false;
+	ii->ii_ParallelWorkers = 0;
+
+	/* set up for possible use by index AM */
+	ii->ii_Am = index->rd_rel->relam;
+	ii->ii_AmCache = NULL;
+	ii->ii_Context = CurrentMemoryContext;
 
 	return ii;
 }
@@ -2410,13 +2423,13 @@ BuildDummyIndexInfo(Relation index)
  * Note: passing collations and opfamilies separately is a kludge.  Adding
  * them to IndexInfo may result in better coding here and elsewhere.
  *
- * Use build_attrmap_by_name(index2, index1) to build the attmap.
+ * Use convert_tuples_by_name_map(index2, index1) to build the attmap.
  */
 bool
 CompareIndexInfo(IndexInfo *info1, IndexInfo *info2,
 				 Oid *collations1, Oid *collations2,
 				 Oid *opfamilies1, Oid *opfamilies2,
-				 AttrMap *attmap)
+				 AttrNumber *attmap, int maplen)
 {
 	int			i;
 
@@ -2443,12 +2456,12 @@ CompareIndexInfo(IndexInfo *info1, IndexInfo *info2,
 	 */
 	for (i = 0; i < info1->ii_NumIndexAttrs; i++)
 	{
-		if (attmap->maplen < info2->ii_IndexAttrNumbers[i])
+		if (maplen < info2->ii_IndexAttrNumbers[i])
 			elog(ERROR, "incorrect attribute map");
 
 		/* ignore expressions at this stage */
 		if ((info1->ii_IndexAttrNumbers[i] != InvalidAttrNumber) &&
-			(attmap->attnums[info2->ii_IndexAttrNumbers[i] - 1] !=
+			(attmap[info2->ii_IndexAttrNumbers[i] - 1] !=
 			 info1->ii_IndexAttrNumbers[i]))
 			return false;
 
@@ -2474,7 +2487,7 @@ CompareIndexInfo(IndexInfo *info1, IndexInfo *info2,
 		Node	   *mapped;
 
 		mapped = map_variable_attnos((Node *) info2->ii_Expressions,
-									 1, 0, attmap,
+									 1, 0, attmap, maplen,
 									 InvalidOid, &found_whole_row);
 		if (found_whole_row)
 		{
@@ -2498,7 +2511,7 @@ CompareIndexInfo(IndexInfo *info1, IndexInfo *info2,
 		Node	   *mapped;
 
 		mapped = map_variable_attnos((Node *) info2->ii_Predicate,
-									 1, 0, attmap,
+									 1, 0, attmap, maplen,
 									 InvalidOid, &found_whole_row);
 		if (found_whole_row)
 		{
@@ -2638,7 +2651,7 @@ FormIndexDatum(IndexInfo *indexInfo,
 			iDatum = ExecEvalExprSwitchContext((ExprState *) lfirst(indexpr_item),
 											   GetPerTupleExprContext(estate),
 											   &isNull);
-			indexpr_item = lnext(indexInfo->ii_ExpressionsState, indexpr_item);
+			indexpr_item = lnext(indexpr_item);
 		}
 		values[i] = iDatum;
 		isnull[i] = isNull;

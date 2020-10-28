@@ -3,7 +3,7 @@
  * rowtypes.c
  *	  I/O and comparison functions for generic composite types.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,8 +16,8 @@
 
 #include <ctype.h>
 
-#include "access/detoast.h"
 #include "access/htup_details.h"
+#include "access/tuptoaster.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "libpq/pqformat.h"
@@ -966,10 +966,8 @@ record_cmp(FunctionCallInfo fcinfo)
 			locfcinfo->args[0].isnull = false;
 			locfcinfo->args[1].value = values2[i2];
 			locfcinfo->args[1].isnull = false;
+			locfcinfo->isnull = false;
 			cmpresult = DatumGetInt32(FunctionCallInvoke(locfcinfo));
-
-			/* We don't expect comparison support functions to return null */
-			Assert(!locfcinfo->isnull);
 
 			if (cmpresult < 0)
 			{
@@ -1202,8 +1200,9 @@ record_eq(PG_FUNCTION_ARGS)
 			locfcinfo->args[0].isnull = false;
 			locfcinfo->args[1].value = values2[i2];
 			locfcinfo->args[1].isnull = false;
+			locfcinfo->isnull = false;
 			oprresult = DatumGetBool(FunctionCallInvoke(locfcinfo));
-			if (locfcinfo->isnull || !oprresult)
+			if (!oprresult)
 			{
 				result = false;
 				break;

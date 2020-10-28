@@ -3,7 +3,6 @@
 # src/tools/msvc/vcregress.pl
 
 use strict;
-use warnings;
 
 our $config;
 
@@ -12,9 +11,8 @@ use File::Basename;
 use File::Copy;
 use File::Find ();
 use File::Path qw(rmtree);
-
-use FindBin;
-use lib $FindBin::RealBin;
+use File::Spec;
+BEGIN { use lib File::Spec->rel2abs(dirname(__FILE__)); }
 
 use Install qw(Install);
 
@@ -198,7 +196,7 @@ sub tap_check
 	  unless $config->{tap_tests};
 
 	my @flags;
-	foreach my $arg (0 .. scalar(@_))
+	foreach my $arg (0 .. scalar(@_) - 1)
 	{
 		next unless $_[$arg] =~ /^PROVE_FLAGS=(.*)/;
 		@flags = split(/\s+/, $1);
@@ -292,6 +290,7 @@ sub mangle_plpython3
 				close($handle);
 				do
 				{
+					s/except ([[:alpha:]][[:alpha:].]*), *([[:alpha:]][[:alpha:]]*):/except $1 as $2:/g;
 					s/<type 'exceptions\.([[:alpha:]]*)'>/<class '$1'>/g;
 					s/<type 'long'>/<class 'int'>/g;
 					s/([0-9][0-9]*)L/$1/g;
@@ -355,8 +354,8 @@ sub plcheck
 		if ($lang eq 'plperl')
 		{
 
-			# plperl tests will install the extensions themselves
-			@lang_args = ();
+			# run both trusted and untrusted perl tests
+			push(@lang_args, "--load-extension=plperlu");
 
 			# assume we're using this perl to built postgres
 			# test if we can run two interpreters in one backend, and if so
@@ -603,7 +602,9 @@ sub upgradecheck
 	print "\nSetting up new cluster\n\n";
 	standard_initdb() or exit 1;
 	print "\nRunning pg_upgrade\n\n";
-	@args = ('pg_upgrade', '-d', "$data.old", '-D', $data, '-b', $bindir);
+	@args = (
+		'pg_upgrade', '-d', "$data.old", '-D', $data, '-b',
+		$bindir,      '-B', $bindir);
 	system(@args) == 0 or exit 1;
 	print "\nStarting new cluster\n\n";
 	@args = ('pg_ctl', '-l', "$logdir/postmaster2.log", 'start');

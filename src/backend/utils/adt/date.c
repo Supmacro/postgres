@@ -3,7 +3,7 @@
  * date.c
  *	  implements DATE and TIME data types specified in SQL standard
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
  *
@@ -18,10 +18,10 @@
 #include <ctype.h>
 #include <limits.h>
 #include <float.h>
+#include <math.h>
 #include <time.h>
 
 #include "access/xact.h"
-#include "common/hashfn.h"
 #include "libpq/pqformat.h"
 #include "miscadmin.h"
 #include "nodes/supportnodes.h"
@@ -30,6 +30,7 @@
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/datetime.h"
+#include "utils/hashutils.h"
 #include "utils/sortsupport.h"
 
 /*
@@ -39,6 +40,11 @@
 #ifdef __FAST_MATH__
 #error -ffast-math is known to break this code
 #endif
+
+
+static int	tm2time(struct pg_tm *tm, fsec_t fsec, TimeADT *result);
+static int	tm2timetz(struct pg_tm *tm, fsec_t fsec, int tz, TimeTzADT *result);
+static void AdjustTimeForTypmod(TimeADT *time, int32 typmod);
 
 
 /* common code for timetypmodin and timetztypmodin */
@@ -550,16 +556,13 @@ date_mii(PG_FUNCTION_ARGS)
 	PG_RETURN_DATEADT(result);
 }
 
-
 /*
- * Promote date to timestamp.
- *
- * On overflow error is thrown if 'overflow' is NULL.  Otherwise, '*overflow'
- * is set to -1 (+1) when result value exceed lower (upper) boundary and zero
- * returned.
+ * Internal routines for promoting date to timestamp and timestamp with
+ * time zone
  */
-Timestamp
-date2timestamp_opt_overflow(DateADT dateVal, int *overflow)
+
+static Timestamp
+date2timestamp(DateADT dateVal)
 {
 	Timestamp	result;
 
@@ -575,19 +578,9 @@ date2timestamp_opt_overflow(DateADT dateVal, int *overflow)
 		 * boundary need be checked for overflow.
 		 */
 		if (dateVal >= (TIMESTAMP_END_JULIAN - POSTGRES_EPOCH_JDATE))
-		{
-			if (overflow)
-			{
-				*overflow = 1;
-				return (Timestamp) 0;
-			}
-			else
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-						 errmsg("date out of range for timestamp")));
-			}
-		}
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("date out of range for timestamp")));
 
 		/* date is days since 2000, timestamp is microseconds since same... */
 		result = dateVal * USECS_PER_DAY;
@@ -596,24 +589,8 @@ date2timestamp_opt_overflow(DateADT dateVal, int *overflow)
 	return result;
 }
 
-/*
- * Single-argument version of date2timestamp_opt_overflow().
- */
 static TimestampTz
-date2timestamp(DateADT dateVal)
-{
-	return date2timestamp_opt_overflow(dateVal, NULL);
-}
-
-/*
- * Promote date to timestamp with time zone.
- *
- * On overflow error is thrown if 'overflow' is NULL.  Otherwise, '*overflow'
- * is set to -1 (+1) when result value exceed lower (upper) boundary and zero
- * returned.
- */
-TimestampTz
-date2timestamptz_opt_overflow(DateADT dateVal, int *overflow)
+date2timestamptz(DateADT dateVal)
 {
 	TimestampTz result;
 	struct pg_tm tt,
@@ -632,19 +609,9 @@ date2timestamptz_opt_overflow(DateADT dateVal, int *overflow)
 		 * boundary need be checked for overflow.
 		 */
 		if (dateVal >= (TIMESTAMP_END_JULIAN - POSTGRES_EPOCH_JDATE))
-		{
-			if (overflow)
-			{
-				*overflow = 1;
-				return (TimestampTz) 0;
-			}
-			else
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-						 errmsg("date out of range for timestamp")));
-			}
-		}
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("date out of range for timestamp")));
 
 		j2date(dateVal + POSTGRES_EPOCH_JDATE,
 			   &(tm->tm_year), &(tm->tm_mon), &(tm->tm_mday));
@@ -660,37 +627,12 @@ date2timestamptz_opt_overflow(DateADT dateVal, int *overflow)
 		 * of time zone, check for allowed timestamp range after adding tz.
 		 */
 		if (!IS_VALID_TIMESTAMP(result))
-		{
-			if (overflow)
-			{
-				if (result < MIN_TIMESTAMP)
-					*overflow = -1;
-				else
-				{
-					Assert(result >= END_TIMESTAMP);
-					*overflow = 1;
-				}
-				return (TimestampTz) 0;
-			}
-			else
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
-						 errmsg("date out of range for timestamp")));
-			}
-		}
+			ereport(ERROR,
+					(errcode(ERRCODE_DATETIME_VALUE_OUT_OF_RANGE),
+					 errmsg("date out of range for timestamp")));
 	}
 
 	return result;
-}
-
-/*
- * Single-argument version of date2timestamptz_opt_overflow().
- */
-static TimestampTz
-date2timestamptz(DateADT dateVal)
-{
-	return date2timestamptz_opt_overflow(dateVal, NULL);
 }
 
 /*
@@ -1262,13 +1204,72 @@ time_in(PG_FUNCTION_ARGS)
 /* tm2time()
  * Convert a tm structure to a time data type.
  */
-int
+static int
 tm2time(struct pg_tm *tm, fsec_t fsec, TimeADT *result)
 {
 	*result = ((((tm->tm_hour * MINS_PER_HOUR + tm->tm_min) * SECS_PER_MINUTE) + tm->tm_sec)
 			   * USECS_PER_SEC) + fsec;
 	return 0;
 }
+
+/* time_overflows()
+ * Check to see if a broken-down time-of-day is out of range.
+ */
+bool
+time_overflows(int hour, int min, int sec, fsec_t fsec)
+{
+	/* Range-check the fields individually. */
+	if (hour < 0 || hour > HOURS_PER_DAY ||
+		min < 0 || min >= MINS_PER_HOUR ||
+		sec < 0 || sec > SECS_PER_MINUTE ||
+		fsec < 0 || fsec > USECS_PER_SEC)
+		return true;
+
+	/*
+	 * Because we allow, eg, hour = 24 or sec = 60, we must check separately
+	 * that the total time value doesn't exceed 24:00:00.
+	 */
+	if ((((((hour * MINS_PER_HOUR + min) * SECS_PER_MINUTE)
+		   + sec) * USECS_PER_SEC) + fsec) > USECS_PER_DAY)
+		return true;
+
+	return false;
+}
+
+/* float_time_overflows()
+ * Same, when we have seconds + fractional seconds as one "double" value.
+ */
+bool
+float_time_overflows(int hour, int min, double sec)
+{
+	/* Range-check the fields individually. */
+	if (hour < 0 || hour > HOURS_PER_DAY ||
+		min < 0 || min >= MINS_PER_HOUR)
+		return true;
+
+	/*
+	 * "sec", being double, requires extra care.  Cope with NaN, and round off
+	 * before applying the range check to avoid unexpected errors due to
+	 * imprecise input.  (We assume rint() behaves sanely with infinities.)
+	 */
+	if (isnan(sec))
+		return true;
+	sec = rint(sec * USECS_PER_SEC);
+	if (sec < 0 || sec > SECS_PER_MINUTE * USECS_PER_SEC)
+		return true;
+
+	/*
+	 * Because we allow, eg, hour = 24 or sec = 60, we must check separately
+	 * that the total time value doesn't exceed 24:00:00.  This must match the
+	 * way that callers will convert the fields to a time.
+	 */
+	if (((((hour * MINS_PER_HOUR + min) * SECS_PER_MINUTE)
+		  * USECS_PER_SEC) + (int64) sec) > USECS_PER_DAY)
+		return true;
+
+	return false;
+}
+
 
 /* time2tm()
  * Convert time data type to POSIX time structure.
@@ -1374,12 +1375,8 @@ make_time(PG_FUNCTION_ARGS)
 	double		sec = PG_GETARG_FLOAT8(2);
 	TimeADT		time;
 
-	/* This should match the checks in DecodeTimeOnly */
-	if (tm_hour < 0 || tm_min < 0 || tm_min > MINS_PER_HOUR - 1 ||
-		sec < 0 || sec > SECS_PER_MINUTE ||
-		tm_hour > HOURS_PER_DAY ||
-	/* test for > 24:00:00 */
-		(tm_hour == HOURS_PER_DAY && (tm_min > 0 || sec > 0)))
+	/* Check for time overflow */
+	if (float_time_overflows(tm_hour, tm_min, sec))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATETIME_FIELD_OVERFLOW),
 				 errmsg("time field value out of range: %d:%02d:%02g",
@@ -1387,7 +1384,7 @@ make_time(PG_FUNCTION_ARGS)
 
 	/* This should match tm2time */
 	time = (((tm_hour * MINS_PER_HOUR + tm_min) * SECS_PER_MINUTE)
-			* USECS_PER_SEC) + rint(sec * USECS_PER_SEC);
+			* USECS_PER_SEC) + (int64) rint(sec * USECS_PER_SEC);
 
 	PG_RETURN_TIMEADT(time);
 }
@@ -1438,7 +1435,7 @@ time_scale(PG_FUNCTION_ARGS)
  * have a fundamental tie together but rather a coincidence of
  * implementation. - thomas
  */
-void
+static void
 AdjustTimeForTypmod(TimeADT *time, int32 typmod)
 {
 	static const int64 TimeScales[MAX_TIME_PRECISION + 1] = {
@@ -2016,7 +2013,7 @@ time_part(PG_FUNCTION_ARGS)
 /* tm2timetz()
  * Convert a tm structure to a time data type.
  */
-int
+static int
 tm2timetz(struct pg_tm *tm, fsec_t fsec, int tz, TimeTzADT *result)
 {
 	result->time = ((((tm->tm_hour * MINS_PER_HOUR + tm->tm_min) * SECS_PER_MINUTE) + tm->tm_sec) *

@@ -7,7 +7,7 @@
  * This file contains WAL control and information functions.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/access/transam/xlogfuncs.c
@@ -27,16 +27,17 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "replication/walreceiver.h"
-#include "storage/fd.h"
-#include "storage/ipc.h"
 #include "storage/smgr.h"
 #include "utils/builtins.h"
-#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/numeric.h"
+#include "utils/guc.h"
 #include "utils/pg_lsn.h"
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
+#include "storage/fd.h"
+#include "storage/ipc.h"
+
 
 /*
  * Store label file and tablespace map during non-exclusive backups.
@@ -186,7 +187,8 @@ pg_stop_backup_v2(PG_FUNCTION_ARGS)
 	if (!(rsinfo->allowedModes & SFRM_Materialize))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not allowed in this context")));
+				 errmsg("materialize mode required, but it is not " \
+						"allowed in this context")));
 
 	/* Build a tuple descriptor for our result type */
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
@@ -252,7 +254,7 @@ pg_stop_backup_v2(PG_FUNCTION_ARGS)
 	values[0] = LSNGetDatum(stoppoint);
 
 	tuplestore_putvalues(tupstore, tupdesc, values, nulls);
-	tuplestore_donestoring(tupstore);
+	tuplestore_donestoring(typstore);
 
 	return (Datum) 0;
 }
@@ -298,8 +300,8 @@ pg_create_restore_point(PG_FUNCTION_ARGS)
 	if (RecoveryInProgress())
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("recovery is in progress"),
-				 errhint("WAL control functions cannot be executed during recovery.")));
+				 (errmsg("recovery is in progress"),
+				  errhint("WAL control functions cannot be executed during recovery."))));
 
 	if (!XLogIsNeeded())
 		ereport(ERROR,
@@ -398,7 +400,7 @@ pg_last_wal_receive_lsn(PG_FUNCTION_ARGS)
 {
 	XLogRecPtr	recptr;
 
-	recptr = GetWalRcvFlushRecPtr(NULL, NULL);
+	recptr = GetWalRcvWriteRecPtr(NULL, NULL);
 
 	if (recptr == 0)
 		PG_RETURN_NULL();
@@ -531,13 +533,6 @@ pg_wal_replay_pause(PG_FUNCTION_ARGS)
 				 errmsg("recovery is not in progress"),
 				 errhint("Recovery control functions can only be executed during recovery.")));
 
-	if (PromoteIsTriggered())
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("standby promotion is ongoing"),
-				 errhint("%s cannot be executed after promotion is triggered.",
-						 "pg_wal_replay_pause()")));
-
 	SetRecoveryPause(true);
 
 	PG_RETURN_VOID();
@@ -557,13 +552,6 @@ pg_wal_replay_resume(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("recovery is not in progress"),
 				 errhint("Recovery control functions can only be executed during recovery.")));
-
-	if (PromoteIsTriggered())
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("standby promotion is ongoing"),
-				 errhint("%s cannot be executed after promotion is triggered.",
-						 "pg_wal_replay_resume()")));
 
 	SetRecoveryPause(false);
 

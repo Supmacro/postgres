@@ -3,7 +3,7 @@
  * pg_depend.c
  *	  routines to support manipulation of the pg_depend relation
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -265,55 +265,6 @@ deleteDependencyRecordsForClass(Oid classId, Oid objectId,
 		Form_pg_depend depform = (Form_pg_depend) GETSTRUCT(tup);
 
 		if (depform->refclassid == refclassId && depform->deptype == deptype)
-		{
-			CatalogTupleDelete(depRel, &tup->t_self);
-			count++;
-		}
-	}
-
-	systable_endscan(scan);
-
-	table_close(depRel, RowExclusiveLock);
-
-	return count;
-}
-
-/*
- * deleteDependencyRecordsForSpecific -- delete all records with given depender
- * classId/objectId, dependee classId/objectId, of the given deptype.
- * Returns the number of records deleted.
- */
-long
-deleteDependencyRecordsForSpecific(Oid classId, Oid objectId, char deptype,
-								   Oid refclassId, Oid refobjectId)
-{
-	long		count = 0;
-	Relation	depRel;
-	ScanKeyData key[2];
-	SysScanDesc scan;
-	HeapTuple	tup;
-
-	depRel = table_open(DependRelationId, RowExclusiveLock);
-
-	ScanKeyInit(&key[0],
-				Anum_pg_depend_classid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(classId));
-	ScanKeyInit(&key[1],
-				Anum_pg_depend_objid,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(objectId));
-
-	scan = systable_beginscan(depRel, DependDependerIndexId, true,
-							  NULL, 2, key);
-
-	while (HeapTupleIsValid(tup = systable_getnext(scan)))
-	{
-		Form_pg_depend depform = (Form_pg_depend) GETSTRUCT(tup);
-
-		if (depform->refclassid == refclassId &&
-			depform->refobjid == refobjectId &&
-			depform->deptype == deptype)
 		{
 			CatalogTupleDelete(depRel, &tup->t_self);
 			count++;
@@ -706,8 +657,8 @@ getAutoExtensionsOfObject(Oid classId, Oid objectId)
 {
 	List	   *result = NIL;
 	Relation	depRel;
-	ScanKeyData key[2];
-	SysScanDesc scan;
+	ScanKeyData	key[2];
+	SysScanDesc	scan;
 	HeapTuple	tup;
 
 	depRel = table_open(DependRelationId, AccessShareLock);
@@ -797,11 +748,10 @@ sequenceIsOwned(Oid seqId, char deptype, Oid *tableId, int32 *colId)
 
 /*
  * Collect a list of OIDs of all sequences owned by the specified relation,
- * and column if specified.  If deptype is not zero, then only find sequences
- * with the specified dependency type.
+ * and column if specified.
  */
-static List *
-getOwnedSequences_internal(Oid relid, AttrNumber attnum, char deptype)
+List *
+getOwnedSequences(Oid relid, AttrNumber attnum)
 {
 	List	   *result = NIL;
 	Relation	depRel;
@@ -843,8 +793,7 @@ getOwnedSequences_internal(Oid relid, AttrNumber attnum, char deptype)
 			(deprec->deptype == DEPENDENCY_AUTO || deprec->deptype == DEPENDENCY_INTERNAL) &&
 			get_rel_relkind(deprec->objid) == RELKIND_SEQUENCE)
 		{
-			if (!deptype || deprec->deptype == deptype)
-				result = lappend_oid(result, deprec->objid);
+			result = lappend_oid(result, deprec->objid);
 		}
 	}
 
@@ -856,32 +805,17 @@ getOwnedSequences_internal(Oid relid, AttrNumber attnum, char deptype)
 }
 
 /*
- * Collect a list of OIDs of all sequences owned (identity or serial) by the
- * specified relation.
- */
-List *
-getOwnedSequences(Oid relid)
-{
-	return getOwnedSequences_internal(relid, 0, 0);
-}
-
-/*
- * Get owned identity sequence, error if not exactly one.
+ * Get owned sequence, error if not exactly one.
  */
 Oid
-getIdentitySequence(Oid relid, AttrNumber attnum, bool missing_ok)
+getOwnedSequence(Oid relid, AttrNumber attnum)
 {
-	List	   *seqlist = getOwnedSequences_internal(relid, attnum, DEPENDENCY_INTERNAL);
+	List	   *seqlist = getOwnedSequences(relid, attnum);
 
 	if (list_length(seqlist) > 1)
 		elog(ERROR, "more than one owned sequence found");
 	else if (list_length(seqlist) < 1)
-	{
-		if (missing_ok)
-			return InvalidOid;
-		else
-			elog(ERROR, "no owned sequence found");
-	}
+		elog(ERROR, "no owned sequence found");
 
 	return linitial_oid(seqlist);
 }

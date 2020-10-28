@@ -5,7 +5,7 @@
  *	  commands.  At one time acted as an interface between the Lisp and C
  *	  systems.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -28,8 +28,8 @@
 #include "commands/alter.h"
 #include "commands/async.h"
 #include "commands/cluster.h"
-#include "commands/collationcmds.h"
 #include "commands/comment.h"
+#include "commands/collationcmds.h"
 #include "commands/conversioncmds.h"
 #include "commands/copy.h"
 #include "commands/createas.h"
@@ -39,8 +39,8 @@
 #include "commands/event_trigger.h"
 #include "commands/explain.h"
 #include "commands/extension.h"
-#include "commands/lockcmds.h"
 #include "commands/matview.h"
+#include "commands/lockcmds.h"
 #include "commands/policy.h"
 #include "commands/portalcmds.h"
 #include "commands/prepare.h"
@@ -68,14 +68,14 @@
 #include "utils/acl.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
-#include "utils/rel.h"
 #include "utils/syscache.h"
+#include "utils/rel.h"
+
 
 /* Hook for plugins to get control in ProcessUtility() */
 ProcessUtility_hook_type ProcessUtility_hook = NULL;
 
 /* local function declarations */
-static int	ClassifyUtilityCommandAsReadOnly(Node *parsetree);
 static void ProcessUtilitySlow(ParseState *pstate,
 							   PlannedStmt *pstmt,
 							   const char *queryString,
@@ -83,8 +83,9 @@ static void ProcessUtilitySlow(ParseState *pstate,
 							   ParamListInfo params,
 							   QueryEnvironment *queryEnv,
 							   DestReceiver *dest,
-							   QueryCompletion *qc);
+							   char *completionTag);
 static void ExecDropStmt(DropStmt *stmt, bool isTopLevel);
+
 
 /*
  * CommandIsReadOnly: is an executable query read-only?
@@ -124,284 +125,115 @@ CommandIsReadOnly(PlannedStmt *pstmt)
 }
 
 /*
- * Determine the degree to which a utility command is read only.
+ * check_xact_readonly: is a utility command read-only?
  *
- * Note the definitions of the relevant flags in src/include/utility/tcop.h.
+ * Here we use the loose rules of XactReadOnly mode: no permanent effects
+ * on the database are allowed.
  */
-static int
-ClassifyUtilityCommandAsReadOnly(Node *parsetree)
+static void
+check_xact_readonly(Node *parsetree)
 {
+	/* Only perform the check if we have a reason to do so. */
+	if (!XactReadOnly && !IsInParallelMode())
+		return;
+
+	/*
+	 * Note: Commands that need to do more complicated checking are handled
+	 * elsewhere, in particular COPY and plannable statements do their own
+	 * checking.  However they should all call PreventCommandIfReadOnly or
+	 * PreventCommandIfParallelMode to actually throw the error.
+	 */
+
 	switch (nodeTag(parsetree))
 	{
-		case T_AlterCollationStmt:
-		case T_AlterDatabaseSetStmt:
 		case T_AlterDatabaseStmt:
-		case T_AlterDefaultPrivilegesStmt:
+		case T_AlterDatabaseSetStmt:
 		case T_AlterDomainStmt:
-		case T_AlterEnumStmt:
-		case T_AlterEventTrigStmt:
-		case T_AlterExtensionContentsStmt:
-		case T_AlterExtensionStmt:
-		case T_AlterFdwStmt:
-		case T_AlterForeignServerStmt:
 		case T_AlterFunctionStmt:
+		case T_AlterRoleStmt:
+		case T_AlterRoleSetStmt:
 		case T_AlterObjectDependsStmt:
 		case T_AlterObjectSchemaStmt:
-		case T_AlterOpFamilyStmt:
-		case T_AlterOperatorStmt:
 		case T_AlterOwnerStmt:
-		case T_AlterPolicyStmt:
-		case T_AlterPublicationStmt:
-		case T_AlterRoleSetStmt:
-		case T_AlterRoleStmt:
+		case T_AlterOperatorStmt:
 		case T_AlterSeqStmt:
-		case T_AlterStatsStmt:
-		case T_AlterSubscriptionStmt:
-		case T_AlterTSConfigurationStmt:
-		case T_AlterTSDictionaryStmt:
 		case T_AlterTableMoveAllStmt:
-		case T_AlterTableSpaceOptionsStmt:
 		case T_AlterTableStmt:
-		case T_AlterTypeStmt:
-		case T_AlterUserMappingStmt:
+		case T_RenameStmt:
 		case T_CommentStmt:
-		case T_CompositeTypeStmt:
-		case T_CreateAmStmt:
+		case T_DefineStmt:
 		case T_CreateCastStmt:
-		case T_CreateConversionStmt:
-		case T_CreateDomainStmt:
-		case T_CreateEnumStmt:
 		case T_CreateEventTrigStmt:
-		case T_CreateExtensionStmt:
-		case T_CreateFdwStmt:
-		case T_CreateForeignServerStmt:
-		case T_CreateForeignTableStmt:
+		case T_AlterEventTrigStmt:
+		case T_CreateConversionStmt:
+		case T_CreatedbStmt:
+		case T_CreateDomainStmt:
 		case T_CreateFunctionStmt:
+		case T_CreateRoleStmt:
+		case T_IndexStmt:
+		case T_CreatePLangStmt:
 		case T_CreateOpClassStmt:
 		case T_CreateOpFamilyStmt:
-		case T_CreatePLangStmt:
-		case T_CreatePolicyStmt:
-		case T_CreatePublicationStmt:
-		case T_CreateRangeStmt:
-		case T_CreateRoleStmt:
+		case T_AlterOpFamilyStmt:
+		case T_RuleStmt:
 		case T_CreateSchemaStmt:
 		case T_CreateSeqStmt:
-		case T_CreateStatsStmt:
 		case T_CreateStmt:
-		case T_CreateSubscriptionStmt:
 		case T_CreateTableAsStmt:
+		case T_RefreshMatViewStmt:
 		case T_CreateTableSpaceStmt:
 		case T_CreateTransformStmt:
 		case T_CreateTrigStmt:
-		case T_CreateUserMappingStmt:
-		case T_CreatedbStmt:
-		case T_DefineStmt:
-		case T_DropOwnedStmt:
-		case T_DropRoleStmt:
-		case T_DropStmt:
-		case T_DropSubscriptionStmt:
-		case T_DropTableSpaceStmt:
-		case T_DropUserMappingStmt:
-		case T_DropdbStmt:
-		case T_GrantRoleStmt:
-		case T_GrantStmt:
-		case T_ImportForeignSchemaStmt:
-		case T_IndexStmt:
-		case T_ReassignOwnedStmt:
-		case T_RefreshMatViewStmt:
-		case T_RenameStmt:
-		case T_RuleStmt:
-		case T_SecLabelStmt:
-		case T_TruncateStmt:
+		case T_CompositeTypeStmt:
+		case T_CreateEnumStmt:
+		case T_CreateRangeStmt:
+		case T_AlterEnumStmt:
 		case T_ViewStmt:
-			{
-				/* DDL is not read-only, and neither is TRUNCATE. */
-				return COMMAND_IS_NOT_READ_ONLY;
-			}
-
-		case T_AlterSystemStmt:
-			{
-				/*
-				 * Surprisingly, ALTER SYSTEM meets all our definitions of
-				 * read-only: it changes nothing that affects the output of
-				 * pg_dump, it doesn't write WAL or imperil the application of
-				 * future WAL, and it doesn't depend on any state that needs
-				 * to be synchronized with parallel workers.
-				 *
-				 * So, despite the fact that it writes to a file, it's read
-				 * only!
-				 */
-				return COMMAND_IS_STRICTLY_READ_ONLY;
-			}
-
-		case T_CallStmt:
-		case T_DoStmt:
-			{
-				/*
-				 * Commands inside the DO block or the called procedure might
-				 * not be read only, but they'll be checked separately when we
-				 * try to execute them.  Here we only need to worry about the
-				 * DO or CALL command itself.
-				 */
-				return COMMAND_IS_STRICTLY_READ_ONLY;
-			}
-
-		case T_CheckPointStmt:
-			{
-				/*
-				 * You might think that this should not be permitted in
-				 * recovery, but we interpret a CHECKPOINT command during
-				 * recovery as a request for a restartpoint instead. We allow
-				 * this since it can be a useful way of reducing switchover
-				 * time when using various forms of replication.
-				 */
-				return COMMAND_IS_STRICTLY_READ_ONLY;
-			}
-
-		case T_ClosePortalStmt:
-		case T_ConstraintsSetStmt:
-		case T_DeallocateStmt:
-		case T_DeclareCursorStmt:
-		case T_DiscardStmt:
-		case T_ExecuteStmt:
-		case T_FetchStmt:
-		case T_LoadStmt:
-		case T_PrepareStmt:
-		case T_UnlistenStmt:
-		case T_VariableSetStmt:
-			{
-				/*
-				 * These modify only backend-local state, so they're OK to run
-				 * in a read-only transaction or on a standby. However, they
-				 * are disallowed in parallel mode, because they either rely
-				 * upon or modify backend-local state that might not be
-				 * synchronized among cooperating backends.
-				 */
-				return COMMAND_OK_IN_RECOVERY | COMMAND_OK_IN_READ_ONLY_TXN;
-			}
-
-		case T_ClusterStmt:
-		case T_ReindexStmt:
-		case T_VacuumStmt:
-			{
-				/*
-				 * These commands write WAL, so they're not strictly
-				 * read-only, and running them in parallel workers isn't
-				 * supported.
-				 *
-				 * However, they don't change the database state in a way that
-				 * would affect pg_dump output, so it's fine to run them in a
-				 * read-only transaction. (CLUSTER might change the order of
-				 * rows on disk, which could affect the ordering of pg_dump
-				 * output, but that's not semantically significant.)
-				 */
-				return COMMAND_OK_IN_READ_ONLY_TXN;
-			}
-
-		case T_CopyStmt:
-			{
-				CopyStmt   *stmt = (CopyStmt *) parsetree;
-
-				/*
-				 * You might think that COPY FROM is not at all read only, but
-				 * it's OK to copy into a temporary table, because that
-				 * wouldn't change the output of pg_dump.  If the target table
-				 * turns out to be non-temporary, DoCopy itself will call
-				 * PreventCommandIfReadOnly.
-				 */
-				if (stmt->is_from)
-					return COMMAND_OK_IN_READ_ONLY_TXN;
-				else
-					return COMMAND_IS_STRICTLY_READ_ONLY;
-			}
-
-		case T_ExplainStmt:
-		case T_VariableShowStmt:
-			{
-				/*
-				 * These commands don't modify any data and are safe to run in
-				 * a parallel worker.
-				 */
-				return COMMAND_IS_STRICTLY_READ_ONLY;
-			}
-
-		case T_ListenStmt:
-		case T_NotifyStmt:
-			{
-				/*
-				 * NOTIFY requires an XID assignment, so it can't be permitted
-				 * on a standby. Perhaps LISTEN could, since without NOTIFY it
-				 * would be OK to just do nothing, at least until promotion,
-				 * but we currently prohibit it lest the user get the wrong
-				 * idea.
-				 *
-				 * (We do allow T_UnlistenStmt on a standby, though, because
-				 * it's a no-op.)
-				 */
-				return COMMAND_OK_IN_READ_ONLY_TXN;
-			}
-
-		case T_LockStmt:
-			{
-				LockStmt   *stmt = (LockStmt *) parsetree;
-
-				/*
-				 * Only weaker locker modes are allowed during recovery. The
-				 * restrictions here must match those in
-				 * LockAcquireExtended().
-				 */
-				if (stmt->mode > RowExclusiveLock)
-					return COMMAND_OK_IN_READ_ONLY_TXN;
-				else
-					return COMMAND_IS_STRICTLY_READ_ONLY;
-			}
-
-		case T_TransactionStmt:
-			{
-				TransactionStmt *stmt = (TransactionStmt *) parsetree;
-
-				/*
-				 * PREPARE, COMMIT PREPARED, and ROLLBACK PREPARED all write
-				 * WAL, so they're not read-only in the strict sense; but the
-				 * first and third do not change pg_dump output, so they're OK
-				 * in a read-only transactions.
-				 *
-				 * We also consider COMMIT PREPARED to be OK in a read-only
-				 * transaction environment, by way of exception.
-				 */
-				switch (stmt->kind)
-				{
-					case TRANS_STMT_BEGIN:
-					case TRANS_STMT_START:
-					case TRANS_STMT_COMMIT:
-					case TRANS_STMT_ROLLBACK:
-					case TRANS_STMT_SAVEPOINT:
-					case TRANS_STMT_RELEASE:
-					case TRANS_STMT_ROLLBACK_TO:
-						return COMMAND_IS_STRICTLY_READ_ONLY;
-
-					case TRANS_STMT_PREPARE:
-					case TRANS_STMT_COMMIT_PREPARED:
-					case TRANS_STMT_ROLLBACK_PREPARED:
-						return COMMAND_OK_IN_READ_ONLY_TXN;
-				}
-				elog(ERROR, "unrecognized TransactionStmtKind: %d",
-					 (int) stmt->kind);
-				return 0;		/* silence stupider compilers */
-			}
-
+		case T_DropStmt:
+		case T_DropdbStmt:
+		case T_DropTableSpaceStmt:
+		case T_DropRoleStmt:
+		case T_GrantStmt:
+		case T_GrantRoleStmt:
+		case T_AlterDefaultPrivilegesStmt:
+		case T_TruncateStmt:
+		case T_DropOwnedStmt:
+		case T_ReassignOwnedStmt:
+		case T_AlterTSDictionaryStmt:
+		case T_AlterTSConfigurationStmt:
+		case T_CreateExtensionStmt:
+		case T_AlterExtensionStmt:
+		case T_AlterExtensionContentsStmt:
+		case T_CreateFdwStmt:
+		case T_AlterFdwStmt:
+		case T_CreateForeignServerStmt:
+		case T_AlterForeignServerStmt:
+		case T_CreateUserMappingStmt:
+		case T_AlterUserMappingStmt:
+		case T_DropUserMappingStmt:
+		case T_AlterTableSpaceOptionsStmt:
+		case T_CreateForeignTableStmt:
+		case T_ImportForeignSchemaStmt:
+		case T_SecLabelStmt:
+		case T_CreatePublicationStmt:
+		case T_AlterPublicationStmt:
+		case T_CreateSubscriptionStmt:
+		case T_AlterSubscriptionStmt:
+		case T_DropSubscriptionStmt:
+			PreventCommandIfReadOnly(CreateCommandTag(parsetree));
+			PreventCommandIfParallelMode(CreateCommandTag(parsetree));
+			break;
 		default:
-			elog(ERROR, "unrecognized node type: %d",
-				 (int) nodeTag(parsetree));
-			return 0;			/* silence stupider compilers */
+			/* do nothing */
+			break;
 	}
 }
 
 /*
  * PreventCommandIfReadOnly: throw error if XactReadOnly
  *
- * This is useful partly to ensure consistency of the error message wording;
- * some callers have checked XactReadOnly for themselves.
+ * This is useful mainly to ensure consistency of the error message wording;
+ * most callers have checked XactReadOnly for themselves.
  */
 void
 PreventCommandIfReadOnly(const char *cmdname)
@@ -418,8 +250,8 @@ PreventCommandIfReadOnly(const char *cmdname)
  * PreventCommandIfParallelMode: throw error if current (sub)transaction is
  * in parallel mode.
  *
- * This is useful partly to ensure consistency of the error message wording;
- * some callers have checked IsInParallelMode() for themselves.
+ * This is useful mainly to ensure consistency of the error message wording;
+ * most callers have checked IsInParallelMode() for themselves.
  */
 void
 PreventCommandIfParallelMode(const char *cmdname)
@@ -469,6 +301,7 @@ CheckRestrictedOperation(const char *cmdname)
 						cmdname)));
 }
 
+
 /*
  * ProcessUtility
  *		general utility function invoker
@@ -481,12 +314,16 @@ CheckRestrictedOperation(const char *cmdname)
  *	queryEnv: environment for parse through execution (e.g., ephemeral named
  *		tables like trigger transition tables).  May be NULL.
  *	dest: where to send results
- *	qc: where to store command completion status data.  May be NULL,
- *		but if not, then caller must have initialized it.
+ *	completionTag: points to a buffer of size COMPLETION_TAG_BUFSIZE
+ *		in which to store a command completion status string.
  *
  * Caller MUST supply a queryString; it is not allowed (anymore) to pass NULL.
  * If you really don't have source text, you can pass a constant string,
  * perhaps "(query not available)".
+ *
+ * completionTag is only set nonempty if we want to return a nondefault status.
+ *
+ * completionTag may be NULL if caller doesn't want a status string.
  *
  * Note for users of ProcessUtility_hook: the same queryString may be passed
  * to multiple invocations of ProcessUtility when processing a query string
@@ -504,12 +341,11 @@ ProcessUtility(PlannedStmt *pstmt,
 			   ParamListInfo params,
 			   QueryEnvironment *queryEnv,
 			   DestReceiver *dest,
-			   QueryCompletion *qc)
+			   char *completionTag)
 {
 	Assert(IsA(pstmt, PlannedStmt));
 	Assert(pstmt->commandType == CMD_UTILITY);
 	Assert(queryString != NULL);	/* required as of 8.4 */
-	Assert(qc == NULL || qc->commandTag == CMDTAG_UNKNOWN);
 
 	/*
 	 * We provide a function hook variable that lets loadable plugins get
@@ -519,11 +355,11 @@ ProcessUtility(PlannedStmt *pstmt,
 	if (ProcessUtility_hook)
 		(*ProcessUtility_hook) (pstmt, queryString,
 								context, params, queryEnv,
-								dest, qc);
+								dest, completionTag);
 	else
 		standard_ProcessUtility(pstmt, queryString,
 								context, params, queryEnv,
-								dest, qc);
+								dest, completionTag);
 }
 
 /*
@@ -544,35 +380,23 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 						ParamListInfo params,
 						QueryEnvironment *queryEnv,
 						DestReceiver *dest,
-						QueryCompletion *qc)
+						char *completionTag)
 {
 	Node	   *parsetree = pstmt->utilityStmt;
 	bool		isTopLevel = (context == PROCESS_UTILITY_TOPLEVEL);
 	bool		isAtomicContext = (!(context == PROCESS_UTILITY_TOPLEVEL || context == PROCESS_UTILITY_QUERY_NONATOMIC) || IsTransactionBlock());
 	ParseState *pstate;
-	int			readonly_flags;
 
 	/* This can recurse, so check for excessive recursion */
 	check_stack_depth();
 
-	/* Prohibit read/write commands in read-only states. */
-	readonly_flags = ClassifyUtilityCommandAsReadOnly(parsetree);
-	if (readonly_flags != COMMAND_IS_STRICTLY_READ_ONLY &&
-		(XactReadOnly || IsInParallelMode()))
-	{
-		CommandTag	commandtag = CreateCommandTag(parsetree);
+	check_xact_readonly(parsetree);
 
-		if ((readonly_flags & COMMAND_OK_IN_READ_ONLY_TXN) == 0)
-			PreventCommandIfReadOnly(GetCommandTagName(commandtag));
-		if ((readonly_flags & COMMAND_OK_IN_PARALLEL_MODE) == 0)
-			PreventCommandIfParallelMode(GetCommandTagName(commandtag));
-		if ((readonly_flags & COMMAND_OK_IN_RECOVERY) == 0)
-			PreventCommandDuringRecovery(GetCommandTagName(commandtag));
-	}
+	if (completionTag)
+		completionTag[0] = '\0';
 
 	pstate = make_parsestate(NULL);
 	pstate->p_sourcetext = queryString;
-	pstate->p_queryEnv = queryEnv;
 
 	switch (nodeTag(parsetree))
 	{
@@ -618,28 +442,31 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 					case TRANS_STMT_COMMIT:
 						if (!EndTransactionBlock(stmt->chain))
 						{
-							/* report unsuccessful commit in qc */
-							if (qc)
-								SetQueryCompletion(qc, CMDTAG_ROLLBACK, 0);
+							/* report unsuccessful commit in completionTag */
+							if (completionTag)
+								strcpy(completionTag, "ROLLBACK");
 						}
 						break;
 
 					case TRANS_STMT_PREPARE:
+						PreventCommandDuringRecovery("PREPARE TRANSACTION");
 						if (!PrepareTransactionBlock(stmt->gid))
 						{
-							/* report unsuccessful commit in qc */
-							if (qc)
-								SetQueryCompletion(qc, CMDTAG_ROLLBACK, 0);
+							/* report unsuccessful commit in completionTag */
+							if (completionTag)
+								strcpy(completionTag, "ROLLBACK");
 						}
 						break;
 
 					case TRANS_STMT_COMMIT_PREPARED:
 						PreventInTransactionBlock(isTopLevel, "COMMIT PREPARED");
+						PreventCommandDuringRecovery("COMMIT PREPARED");
 						FinishPreparedTransaction(stmt->gid, true);
 						break;
 
 					case TRANS_STMT_ROLLBACK_PREPARED:
 						PreventInTransactionBlock(isTopLevel, "ROLLBACK PREPARED");
+						PreventCommandDuringRecovery("ROLLBACK PREPARED");
 						FinishPreparedTransaction(stmt->gid, false);
 						break;
 
@@ -674,8 +501,8 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			 * Portal (cursor) manipulation
 			 */
 		case T_DeclareCursorStmt:
-			PerformCursorOpen(pstate, (DeclareCursorStmt *) parsetree, params,
-							  isTopLevel);
+			PerformCursorOpen((DeclareCursorStmt *) parsetree, params,
+							  queryString, isTopLevel);
 			break;
 
 		case T_ClosePortalStmt:
@@ -688,7 +515,8 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			break;
 
 		case T_FetchStmt:
-			PerformPortalFetch((FetchStmt *) parsetree, dest, qc);
+			PerformPortalFetch((FetchStmt *) parsetree, dest,
+							   completionTag);
 			break;
 
 		case T_DoStmt:
@@ -723,22 +551,22 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 				DoCopy(pstate, (CopyStmt *) parsetree,
 					   pstmt->stmt_location, pstmt->stmt_len,
 					   &processed);
-				if (qc)
-					SetQueryCompletion(qc, CMDTAG_COPY, processed);
+				if (completionTag)
+					snprintf(completionTag, COMPLETION_TAG_BUFSIZE,
+							 "COPY " UINT64_FORMAT, processed);
 			}
 			break;
 
 		case T_PrepareStmt:
 			CheckRestrictedOperation("PREPARE");
-			PrepareQuery(pstate, (PrepareStmt *) parsetree,
+			PrepareQuery((PrepareStmt *) parsetree, queryString,
 						 pstmt->stmt_location, pstmt->stmt_len);
 			break;
 
 		case T_ExecuteStmt:
-			ExecuteQuery(pstate,
-						 (ExecuteStmt *) parsetree, NULL,
-						 params,
-						 dest, qc);
+			ExecuteQuery((ExecuteStmt *) parsetree, NULL,
+						 queryString, params,
+						 dest, completionTag);
 			break;
 
 		case T_DeallocateStmt:
@@ -768,9 +596,13 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			break;
 
 		case T_DropdbStmt:
-			/* no event triggers for global objects */
-			PreventInTransactionBlock(isTopLevel, "DROP DATABASE");
-			DropDatabase(pstate, (DropdbStmt *) parsetree);
+			{
+				DropdbStmt *stmt = (DropdbStmt *) parsetree;
+
+				/* no event triggers for global objects */
+				PreventInTransactionBlock(isTopLevel, "DROP DATABASE");
+				dropdb(stmt->dbname, stmt->missing_ok);
+			}
 			break;
 
 			/* Query-level asynchronous notification */
@@ -778,6 +610,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			{
 				NotifyStmt *stmt = (NotifyStmt *) parsetree;
 
+				PreventCommandDuringRecovery("NOTIFY");
 				Async_Notify(stmt->conditionname, stmt->payload);
 			}
 			break;
@@ -786,6 +619,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			{
 				ListenStmt *stmt = (ListenStmt *) parsetree;
 
+				PreventCommandDuringRecovery("LISTEN");
 				CheckRestrictedOperation("LISTEN");
 				Async_Listen(stmt->conditionname);
 			}
@@ -795,6 +629,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			{
 				UnlistenStmt *stmt = (UnlistenStmt *) parsetree;
 
+				/* we allow UNLISTEN during recovery, as it's a noop */
 				CheckRestrictedOperation("UNLISTEN");
 				if (stmt->conditionname)
 					Async_Unlisten(stmt->conditionname);
@@ -818,15 +653,27 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			break;
 
 		case T_ClusterStmt:
+			/* we choose to allow this during "read only" transactions */
+			PreventCommandDuringRecovery("CLUSTER");
+			/* forbidden in parallel mode due to CommandIsReadOnly */
 			cluster((ClusterStmt *) parsetree, isTopLevel);
 			break;
 
 		case T_VacuumStmt:
-			ExecVacuum(pstate, (VacuumStmt *) parsetree, isTopLevel);
+			{
+				VacuumStmt *stmt = (VacuumStmt *) parsetree;
+
+				/* we choose to allow this during "read only" transactions */
+				PreventCommandDuringRecovery(stmt->is_vacuumcmd ?
+											 "VACUUM" : "ANALYZE");
+				/* forbidden in parallel mode due to CommandIsReadOnly */
+				ExecVacuum(pstate, stmt, isTopLevel);
+			}
 			break;
 
 		case T_ExplainStmt:
-			ExplainQuery(pstate, (ExplainStmt *) parsetree, params, dest);
+			ExplainQuery(pstate, (ExplainStmt *) parsetree, queryString, params,
+						 queryEnv, dest);
 			break;
 
 		case T_AlterSystemStmt:
@@ -897,6 +744,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			 * outside a transaction block is presumed to be user error.
 			 */
 			RequireTransactionBlock(isTopLevel, "LOCK TABLE");
+			/* forbidden in parallel mode due to CommandIsReadOnly */
 			LockTableCommand((LockStmt *) parsetree);
 			break;
 
@@ -911,6 +759,13 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 						 errmsg("must be superuser to do CHECKPOINT")));
 
+			/*
+			 * You might think we should have a PreventCommandDuringRecovery()
+			 * here, but we interpret a CHECKPOINT command during recovery as
+			 * a request for a restartpoint instead. We allow this since it
+			 * can be a useful way of reducing switchover time when using
+			 * various forms of replication.
+			 */
 			RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_WAIT |
 							  (RecoveryInProgress() ? 0 : CHECKPOINT_FORCE));
 			break;
@@ -923,6 +778,9 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 					PreventInTransactionBlock(isTopLevel,
 											  "REINDEX CONCURRENTLY");
 
+				/* we choose to allow this during "read only" transactions */
+				PreventCommandDuringRecovery("REINDEX");
+				/* forbidden in parallel mode due to CommandIsReadOnly */
 				switch (stmt->kind)
 				{
 					case REINDEX_OBJECT_INDEX:
@@ -967,7 +825,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 				if (EventTriggerSupportsObjectType(stmt->objtype))
 					ProcessUtilitySlow(pstate, pstmt, queryString,
 									   context, params, queryEnv,
-									   dest, qc);
+									   dest, completionTag);
 				else
 					ExecuteGrantStmt(stmt);
 			}
@@ -980,7 +838,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 				if (EventTriggerSupportsObjectType(stmt->removeType))
 					ProcessUtilitySlow(pstate, pstmt, queryString,
 									   context, params, queryEnv,
-									   dest, qc);
+									   dest, completionTag);
 				else
 					ExecDropStmt(stmt, isTopLevel);
 			}
@@ -993,7 +851,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 				if (EventTriggerSupportsObjectType(stmt->renameType))
 					ProcessUtilitySlow(pstate, pstmt, queryString,
 									   context, params, queryEnv,
-									   dest, qc);
+									   dest, completionTag);
 				else
 					ExecRenameStmt(stmt);
 			}
@@ -1006,7 +864,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 				if (EventTriggerSupportsObjectType(stmt->objectType))
 					ProcessUtilitySlow(pstate, pstmt, queryString,
 									   context, params, queryEnv,
-									   dest, qc);
+									   dest, completionTag);
 				else
 					ExecAlterObjectDependsStmt(stmt, NULL);
 			}
@@ -1019,7 +877,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 				if (EventTriggerSupportsObjectType(stmt->objectType))
 					ProcessUtilitySlow(pstate, pstmt, queryString,
 									   context, params, queryEnv,
-									   dest, qc);
+									   dest, completionTag);
 				else
 					ExecAlterObjectSchemaStmt(stmt, NULL);
 			}
@@ -1032,7 +890,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 				if (EventTriggerSupportsObjectType(stmt->objectType))
 					ProcessUtilitySlow(pstate, pstmt, queryString,
 									   context, params, queryEnv,
-									   dest, qc);
+									   dest, completionTag);
 				else
 					ExecAlterOwnerStmt(stmt);
 			}
@@ -1045,7 +903,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 				if (EventTriggerSupportsObjectType(stmt->objtype))
 					ProcessUtilitySlow(pstate, pstmt, queryString,
 									   context, params, queryEnv,
-									   dest, qc);
+									   dest, completionTag);
 				else
 					CommentObject(stmt);
 				break;
@@ -1058,7 +916,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 				if (EventTriggerSupportsObjectType(stmt->objtype))
 					ProcessUtilitySlow(pstate, pstmt, queryString,
 									   context, params, queryEnv,
-									   dest, qc);
+									   dest, completionTag);
 				else
 					ExecSecLabelStmt(stmt);
 				break;
@@ -1068,7 +926,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 			/* All other statement types have event trigger support */
 			ProcessUtilitySlow(pstate, pstmt, queryString,
 							   context, params, queryEnv,
-							   dest, qc);
+							   dest, completionTag);
 			break;
 	}
 
@@ -1095,7 +953,7 @@ ProcessUtilitySlow(ParseState *pstate,
 				   ParamListInfo params,
 				   QueryEnvironment *queryEnv,
 				   DestReceiver *dest,
-				   QueryCompletion *qc)
+				   char *completionTag)
 {
 	Node	   *parsetree = pstmt->utilityStmt;
 	bool		isTopLevel = (context == PROCESS_UTILITY_TOPLEVEL);
@@ -1223,7 +1081,7 @@ ProcessUtilitySlow(ParseState *pstate,
 						}
 
 						/* Need CCI between commands */
-						if (lnext(stmts, l) != NULL)
+						if (lnext(l) != NULL)
 							CommandCounterIncrement();
 					}
 
@@ -1239,6 +1097,8 @@ ProcessUtilitySlow(ParseState *pstate,
 				{
 					AlterTableStmt *atstmt = (AlterTableStmt *) parsetree;
 					Oid			relid;
+					List	   *stmts;
+					ListCell   *l;
 					LOCKMODE	lockmode;
 
 					/*
@@ -1252,21 +1112,59 @@ ProcessUtilitySlow(ParseState *pstate,
 
 					if (OidIsValid(relid))
 					{
-						AlterTableUtilityContext atcontext;
-
-						/* Set up info needed for recursive callbacks ... */
-						atcontext.pstmt = pstmt;
-						atcontext.queryString = queryString;
-						atcontext.relid = relid;
-						atcontext.params = params;
-						atcontext.queryEnv = queryEnv;
+						/* Run parse analysis ... */
+						stmts = transformAlterTableStmt(relid, atstmt,
+														queryString);
 
 						/* ... ensure we have an event trigger context ... */
 						EventTriggerAlterTableStart(parsetree);
 						EventTriggerAlterTableRelid(relid);
 
 						/* ... and do it */
-						AlterTable(atstmt, lockmode, &atcontext);
+						foreach(l, stmts)
+						{
+							Node	   *stmt = (Node *) lfirst(l);
+
+							if (IsA(stmt, AlterTableStmt))
+							{
+								/* Do the table alteration proper */
+								AlterTable(relid, lockmode,
+										   (AlterTableStmt *) stmt);
+							}
+							else
+							{
+								/*
+								 * Recurse for anything else.  If we need to
+								 * do so, "close" the current complex-command
+								 * set, and start a new one at the bottom;
+								 * this is needed to ensure the ordering of
+								 * queued commands is consistent with the way
+								 * they are executed here.
+								 */
+								PlannedStmt *wrapper;
+
+								EventTriggerAlterTableEnd();
+								wrapper = makeNode(PlannedStmt);
+								wrapper->commandType = CMD_UTILITY;
+								wrapper->canSetTag = false;
+								wrapper->utilityStmt = stmt;
+								wrapper->stmt_location = pstmt->stmt_location;
+								wrapper->stmt_len = pstmt->stmt_len;
+								ProcessUtility(wrapper,
+											   queryString,
+											   PROCESS_UTILITY_SUBCOMMAND,
+											   params,
+											   NULL,
+											   None_Receiver,
+											   NULL);
+								EventTriggerAlterTableStart(parsetree);
+								EventTriggerAlterTableRelid(relid);
+							}
+
+							/* Need CCI between commands */
+							if (lnext(l) != NULL)
+								CommandCounterIncrement();
+						}
 
 						/* done */
 						EventTriggerAlterTableEnd();
@@ -1597,8 +1495,9 @@ ProcessUtilitySlow(ParseState *pstate,
 				break;
 
 			case T_CreateTableAsStmt:
-				address = ExecCreateTableAs(pstate, (CreateTableAsStmt *) parsetree,
-											params, queryEnv, qc);
+				address = ExecCreateTableAs((CreateTableAsStmt *) parsetree,
+											queryString, params, queryEnv,
+											completionTag);
 				break;
 
 			case T_RefreshMatViewStmt:
@@ -1613,13 +1512,15 @@ ProcessUtilitySlow(ParseState *pstate,
 				PG_TRY();
 				{
 					address = ExecRefreshMatView((RefreshMatViewStmt *) parsetree,
-												 queryString, params, qc);
+												 queryString, params, completionTag);
 				}
-				PG_FINALLY();
+				PG_CATCH();
 				{
 					EventTriggerUndoInhibitCommandCollection();
+					PG_RE_THROW();
 				}
 				PG_END_TRY();
+				EventTriggerUndoInhibitCommandCollection();
 				break;
 
 			case T_CreateTrigStmt:
@@ -1716,10 +1617,6 @@ ProcessUtilitySlow(ParseState *pstate,
 				address = AlterOperator((AlterOperatorStmt *) parsetree);
 				break;
 
-			case T_AlterTypeStmt:
-				address = AlterType((AlterTypeStmt *) parsetree);
-				break;
-
 			case T_CommentStmt:
 				address = CommentObject((CommentStmt *) parsetree);
 				break;
@@ -1791,10 +1688,6 @@ ProcessUtilitySlow(ParseState *pstate,
 				address = CreateStatistics((CreateStatsStmt *) parsetree);
 				break;
 
-			case T_AlterStatsStmt:
-				address = AlterStatistics((AlterStatsStmt *) parsetree);
-				break;
-
 			case T_AlterCollationStmt:
 				address = AlterCollation((AlterCollationStmt *) parsetree);
 				break;
@@ -1819,58 +1712,16 @@ ProcessUtilitySlow(ParseState *pstate,
 			EventTriggerDDLCommandEnd(parsetree);
 		}
 	}
-	PG_FINALLY();
+	PG_CATCH();
 	{
 		if (needCleanup)
 			EventTriggerEndCompleteQuery();
+		PG_RE_THROW();
 	}
 	PG_END_TRY();
-}
 
-/*
- * ProcessUtilityForAlterTable
- *		Recursive entry from ALTER TABLE
- *
- * ALTER TABLE sometimes generates subcommands such as CREATE INDEX.
- * It calls this, not the main entry point ProcessUtility, to execute
- * such subcommands.
- *
- * stmt: the utility command to execute
- * context: opaque passthrough struct with the info we need
- *
- * It's caller's responsibility to do CommandCounterIncrement after
- * calling this, if needed.
- */
-void
-ProcessUtilityForAlterTable(Node *stmt, AlterTableUtilityContext *context)
-{
-	PlannedStmt *wrapper;
-
-	/*
-	 * For event triggers, we must "close" the current complex-command set,
-	 * and start a new one afterwards; this is needed to ensure the ordering
-	 * of command events is consistent with the way they were executed.
-	 */
-	EventTriggerAlterTableEnd();
-
-	/* Create a suitable wrapper */
-	wrapper = makeNode(PlannedStmt);
-	wrapper->commandType = CMD_UTILITY;
-	wrapper->canSetTag = false;
-	wrapper->utilityStmt = stmt;
-	wrapper->stmt_location = context->pstmt->stmt_location;
-	wrapper->stmt_len = context->pstmt->stmt_len;
-
-	ProcessUtility(wrapper,
-				   context->queryString,
-				   PROCESS_UTILITY_SUBCOMMAND,
-				   context->params,
-				   context->queryEnv,
-				   None_Receiver,
-				   NULL);
-
-	EventTriggerAlterTableStart(context->pstmt->utilityStmt);
-	EventTriggerAlterTableRelid(context->relid);
+	if (needCleanup)
+		EventTriggerEndCompleteQuery();
 }
 
 /*
@@ -2096,137 +1947,137 @@ UtilityContainsQuery(Node *parsetree)
  *
  * This covers most cases where ALTER is used with an ObjectType enum.
  */
-static CommandTag
+static const char *
 AlterObjectTypeCommandTag(ObjectType objtype)
 {
-	CommandTag	tag;
+	const char *tag;
 
 	switch (objtype)
 	{
 		case OBJECT_AGGREGATE:
-			tag = CMDTAG_ALTER_AGGREGATE;
+			tag = "ALTER AGGREGATE";
 			break;
 		case OBJECT_ATTRIBUTE:
-			tag = CMDTAG_ALTER_TYPE;
+			tag = "ALTER TYPE";
 			break;
 		case OBJECT_CAST:
-			tag = CMDTAG_ALTER_CAST;
+			tag = "ALTER CAST";
 			break;
 		case OBJECT_COLLATION:
-			tag = CMDTAG_ALTER_COLLATION;
+			tag = "ALTER COLLATION";
 			break;
 		case OBJECT_COLUMN:
-			tag = CMDTAG_ALTER_TABLE;
+			tag = "ALTER TABLE";
 			break;
 		case OBJECT_CONVERSION:
-			tag = CMDTAG_ALTER_CONVERSION;
+			tag = "ALTER CONVERSION";
 			break;
 		case OBJECT_DATABASE:
-			tag = CMDTAG_ALTER_DATABASE;
+			tag = "ALTER DATABASE";
 			break;
 		case OBJECT_DOMAIN:
 		case OBJECT_DOMCONSTRAINT:
-			tag = CMDTAG_ALTER_DOMAIN;
+			tag = "ALTER DOMAIN";
 			break;
 		case OBJECT_EXTENSION:
-			tag = CMDTAG_ALTER_EXTENSION;
+			tag = "ALTER EXTENSION";
 			break;
 		case OBJECT_FDW:
-			tag = CMDTAG_ALTER_FOREIGN_DATA_WRAPPER;
+			tag = "ALTER FOREIGN DATA WRAPPER";
 			break;
 		case OBJECT_FOREIGN_SERVER:
-			tag = CMDTAG_ALTER_SERVER;
+			tag = "ALTER SERVER";
 			break;
 		case OBJECT_FOREIGN_TABLE:
-			tag = CMDTAG_ALTER_FOREIGN_TABLE;
+			tag = "ALTER FOREIGN TABLE";
 			break;
 		case OBJECT_FUNCTION:
-			tag = CMDTAG_ALTER_FUNCTION;
+			tag = "ALTER FUNCTION";
 			break;
 		case OBJECT_INDEX:
-			tag = CMDTAG_ALTER_INDEX;
+			tag = "ALTER INDEX";
 			break;
 		case OBJECT_LANGUAGE:
-			tag = CMDTAG_ALTER_LANGUAGE;
+			tag = "ALTER LANGUAGE";
 			break;
 		case OBJECT_LARGEOBJECT:
-			tag = CMDTAG_ALTER_LARGE_OBJECT;
+			tag = "ALTER LARGE OBJECT";
 			break;
 		case OBJECT_OPCLASS:
-			tag = CMDTAG_ALTER_OPERATOR_CLASS;
+			tag = "ALTER OPERATOR CLASS";
 			break;
 		case OBJECT_OPERATOR:
-			tag = CMDTAG_ALTER_OPERATOR;
+			tag = "ALTER OPERATOR";
 			break;
 		case OBJECT_OPFAMILY:
-			tag = CMDTAG_ALTER_OPERATOR_FAMILY;
+			tag = "ALTER OPERATOR FAMILY";
 			break;
 		case OBJECT_POLICY:
-			tag = CMDTAG_ALTER_POLICY;
+			tag = "ALTER POLICY";
 			break;
 		case OBJECT_PROCEDURE:
-			tag = CMDTAG_ALTER_PROCEDURE;
+			tag = "ALTER PROCEDURE";
 			break;
 		case OBJECT_ROLE:
-			tag = CMDTAG_ALTER_ROLE;
+			tag = "ALTER ROLE";
 			break;
 		case OBJECT_ROUTINE:
-			tag = CMDTAG_ALTER_ROUTINE;
+			tag = "ALTER ROUTINE";
 			break;
 		case OBJECT_RULE:
-			tag = CMDTAG_ALTER_RULE;
+			tag = "ALTER RULE";
 			break;
 		case OBJECT_SCHEMA:
-			tag = CMDTAG_ALTER_SCHEMA;
+			tag = "ALTER SCHEMA";
 			break;
 		case OBJECT_SEQUENCE:
-			tag = CMDTAG_ALTER_SEQUENCE;
+			tag = "ALTER SEQUENCE";
 			break;
 		case OBJECT_TABLE:
 		case OBJECT_TABCONSTRAINT:
-			tag = CMDTAG_ALTER_TABLE;
+			tag = "ALTER TABLE";
 			break;
 		case OBJECT_TABLESPACE:
-			tag = CMDTAG_ALTER_TABLESPACE;
+			tag = "ALTER TABLESPACE";
 			break;
 		case OBJECT_TRIGGER:
-			tag = CMDTAG_ALTER_TRIGGER;
+			tag = "ALTER TRIGGER";
 			break;
 		case OBJECT_EVENT_TRIGGER:
-			tag = CMDTAG_ALTER_EVENT_TRIGGER;
+			tag = "ALTER EVENT TRIGGER";
 			break;
 		case OBJECT_TSCONFIGURATION:
-			tag = CMDTAG_ALTER_TEXT_SEARCH_CONFIGURATION;
+			tag = "ALTER TEXT SEARCH CONFIGURATION";
 			break;
 		case OBJECT_TSDICTIONARY:
-			tag = CMDTAG_ALTER_TEXT_SEARCH_DICTIONARY;
+			tag = "ALTER TEXT SEARCH DICTIONARY";
 			break;
 		case OBJECT_TSPARSER:
-			tag = CMDTAG_ALTER_TEXT_SEARCH_PARSER;
+			tag = "ALTER TEXT SEARCH PARSER";
 			break;
 		case OBJECT_TSTEMPLATE:
-			tag = CMDTAG_ALTER_TEXT_SEARCH_TEMPLATE;
+			tag = "ALTER TEXT SEARCH TEMPLATE";
 			break;
 		case OBJECT_TYPE:
-			tag = CMDTAG_ALTER_TYPE;
+			tag = "ALTER TYPE";
 			break;
 		case OBJECT_VIEW:
-			tag = CMDTAG_ALTER_VIEW;
+			tag = "ALTER VIEW";
 			break;
 		case OBJECT_MATVIEW:
-			tag = CMDTAG_ALTER_MATERIALIZED_VIEW;
+			tag = "ALTER MATERIALIZED VIEW";
 			break;
 		case OBJECT_PUBLICATION:
-			tag = CMDTAG_ALTER_PUBLICATION;
+			tag = "ALTER PUBLICATION";
 			break;
 		case OBJECT_SUBSCRIPTION:
-			tag = CMDTAG_ALTER_SUBSCRIPTION;
+			tag = "ALTER SUBSCRIPTION";
 			break;
 		case OBJECT_STATISTIC_EXT:
-			tag = CMDTAG_ALTER_STATISTICS;
+			tag = "ALTER STATISTICS";
 			break;
 		default:
-			tag = CMDTAG_UNKNOWN;
+			tag = "???";
 			break;
 	}
 
@@ -2235,17 +2086,20 @@ AlterObjectTypeCommandTag(ObjectType objtype)
 
 /*
  * CreateCommandTag
- *		utility to get a CommandTag for the command operation,
+ *		utility to get a string representation of the command operation,
  *		given either a raw (un-analyzed) parsetree, an analyzed Query,
  *		or a PlannedStmt.
  *
  * This must handle all command types, but since the vast majority
  * of 'em are utility commands, it seems sensible to keep it here.
+ *
+ * NB: all result strings must be shorter than COMPLETION_TAG_BUFSIZE.
+ * Also, the result must point at a true constant (permanent storage).
  */
-CommandTag
+const char *
 CreateCommandTag(Node *parsetree)
 {
-	CommandTag	tag;
+	const char *tag;
 
 	switch (nodeTag(parsetree))
 	{
@@ -2256,19 +2110,19 @@ CreateCommandTag(Node *parsetree)
 
 			/* raw plannable queries */
 		case T_InsertStmt:
-			tag = CMDTAG_INSERT;
+			tag = "INSERT";
 			break;
 
 		case T_DeleteStmt:
-			tag = CMDTAG_DELETE;
+			tag = "DELETE";
 			break;
 
 		case T_UpdateStmt:
-			tag = CMDTAG_UPDATE;
+			tag = "UPDATE";
 			break;
 
 		case T_SelectStmt:
-			tag = CMDTAG_SELECT;
+			tag = "SELECT";
 			break;
 
 			/* utility statements --- same whether raw or cooked */
@@ -2279,51 +2133,51 @@ CreateCommandTag(Node *parsetree)
 				switch (stmt->kind)
 				{
 					case TRANS_STMT_BEGIN:
-						tag = CMDTAG_BEGIN;
+						tag = "BEGIN";
 						break;
 
 					case TRANS_STMT_START:
-						tag = CMDTAG_START_TRANSACTION;
+						tag = "START TRANSACTION";
 						break;
 
 					case TRANS_STMT_COMMIT:
-						tag = CMDTAG_COMMIT;
+						tag = "COMMIT";
 						break;
 
 					case TRANS_STMT_ROLLBACK:
 					case TRANS_STMT_ROLLBACK_TO:
-						tag = CMDTAG_ROLLBACK;
+						tag = "ROLLBACK";
 						break;
 
 					case TRANS_STMT_SAVEPOINT:
-						tag = CMDTAG_SAVEPOINT;
+						tag = "SAVEPOINT";
 						break;
 
 					case TRANS_STMT_RELEASE:
-						tag = CMDTAG_RELEASE;
+						tag = "RELEASE";
 						break;
 
 					case TRANS_STMT_PREPARE:
-						tag = CMDTAG_PREPARE_TRANSACTION;
+						tag = "PREPARE TRANSACTION";
 						break;
 
 					case TRANS_STMT_COMMIT_PREPARED:
-						tag = CMDTAG_COMMIT_PREPARED;
+						tag = "COMMIT PREPARED";
 						break;
 
 					case TRANS_STMT_ROLLBACK_PREPARED:
-						tag = CMDTAG_ROLLBACK_PREPARED;
+						tag = "ROLLBACK PREPARED";
 						break;
 
 					default:
-						tag = CMDTAG_UNKNOWN;
+						tag = "???";
 						break;
 				}
 			}
 			break;
 
 		case T_DeclareCursorStmt:
-			tag = CMDTAG_DECLARE_CURSOR;
+			tag = "DECLARE CURSOR";
 			break;
 
 		case T_ClosePortalStmt:
@@ -2331,9 +2185,9 @@ CreateCommandTag(Node *parsetree)
 				ClosePortalStmt *stmt = (ClosePortalStmt *) parsetree;
 
 				if (stmt->portalname == NULL)
-					tag = CMDTAG_CLOSE_CURSOR_ALL;
+					tag = "CLOSE CURSOR ALL";
 				else
-					tag = CMDTAG_CLOSE_CURSOR;
+					tag = "CLOSE CURSOR";
 			}
 			break;
 
@@ -2341,220 +2195,213 @@ CreateCommandTag(Node *parsetree)
 			{
 				FetchStmt  *stmt = (FetchStmt *) parsetree;
 
-				tag = (stmt->ismove) ? CMDTAG_MOVE : CMDTAG_FETCH;
+				tag = (stmt->ismove) ? "MOVE" : "FETCH";
 			}
 			break;
 
 		case T_CreateDomainStmt:
-			tag = CMDTAG_CREATE_DOMAIN;
+			tag = "CREATE DOMAIN";
 			break;
 
 		case T_CreateSchemaStmt:
-			tag = CMDTAG_CREATE_SCHEMA;
+			tag = "CREATE SCHEMA";
 			break;
 
 		case T_CreateStmt:
-			tag = CMDTAG_CREATE_TABLE;
+			tag = "CREATE TABLE";
 			break;
 
 		case T_CreateTableSpaceStmt:
-			tag = CMDTAG_CREATE_TABLESPACE;
+			tag = "CREATE TABLESPACE";
 			break;
 
 		case T_DropTableSpaceStmt:
-			tag = CMDTAG_DROP_TABLESPACE;
+			tag = "DROP TABLESPACE";
 			break;
 
 		case T_AlterTableSpaceOptionsStmt:
-			tag = CMDTAG_ALTER_TABLESPACE;
+			tag = "ALTER TABLESPACE";
 			break;
 
 		case T_CreateExtensionStmt:
-			tag = CMDTAG_CREATE_EXTENSION;
+			tag = "CREATE EXTENSION";
 			break;
 
 		case T_AlterExtensionStmt:
-			tag = CMDTAG_ALTER_EXTENSION;
+			tag = "ALTER EXTENSION";
 			break;
 
 		case T_AlterExtensionContentsStmt:
-			tag = CMDTAG_ALTER_EXTENSION;
+			tag = "ALTER EXTENSION";
 			break;
 
 		case T_CreateFdwStmt:
-			tag = CMDTAG_CREATE_FOREIGN_DATA_WRAPPER;
+			tag = "CREATE FOREIGN DATA WRAPPER";
 			break;
 
 		case T_AlterFdwStmt:
-			tag = CMDTAG_ALTER_FOREIGN_DATA_WRAPPER;
+			tag = "ALTER FOREIGN DATA WRAPPER";
 			break;
 
 		case T_CreateForeignServerStmt:
-			tag = CMDTAG_CREATE_SERVER;
+			tag = "CREATE SERVER";
 			break;
 
 		case T_AlterForeignServerStmt:
-			tag = CMDTAG_ALTER_SERVER;
+			tag = "ALTER SERVER";
 			break;
 
 		case T_CreateUserMappingStmt:
-			tag = CMDTAG_CREATE_USER_MAPPING;
+			tag = "CREATE USER MAPPING";
 			break;
 
 		case T_AlterUserMappingStmt:
-			tag = CMDTAG_ALTER_USER_MAPPING;
+			tag = "ALTER USER MAPPING";
 			break;
 
 		case T_DropUserMappingStmt:
-			tag = CMDTAG_DROP_USER_MAPPING;
+			tag = "DROP USER MAPPING";
 			break;
 
 		case T_CreateForeignTableStmt:
-			tag = CMDTAG_CREATE_FOREIGN_TABLE;
+			tag = "CREATE FOREIGN TABLE";
 			break;
 
 		case T_ImportForeignSchemaStmt:
-			tag = CMDTAG_IMPORT_FOREIGN_SCHEMA;
+			tag = "IMPORT FOREIGN SCHEMA";
 			break;
 
 		case T_DropStmt:
 			switch (((DropStmt *) parsetree)->removeType)
 			{
 				case OBJECT_TABLE:
-					tag = CMDTAG_DROP_TABLE;
+					tag = "DROP TABLE";
 					break;
 				case OBJECT_SEQUENCE:
-					tag = CMDTAG_DROP_SEQUENCE;
+					tag = "DROP SEQUENCE";
 					break;
 				case OBJECT_VIEW:
-					tag = CMDTAG_DROP_VIEW;
+					tag = "DROP VIEW";
 					break;
 				case OBJECT_MATVIEW:
-					tag = CMDTAG_DROP_MATERIALIZED_VIEW;
+					tag = "DROP MATERIALIZED VIEW";
 					break;
 				case OBJECT_INDEX:
-					tag = CMDTAG_DROP_INDEX;
+					tag = "DROP INDEX";
 					break;
 				case OBJECT_TYPE:
-					tag = CMDTAG_DROP_TYPE;
+					tag = "DROP TYPE";
 					break;
 				case OBJECT_DOMAIN:
-					tag = CMDTAG_DROP_DOMAIN;
+					tag = "DROP DOMAIN";
 					break;
 				case OBJECT_COLLATION:
-					tag = CMDTAG_DROP_COLLATION;
+					tag = "DROP COLLATION";
 					break;
 				case OBJECT_CONVERSION:
-					tag = CMDTAG_DROP_CONVERSION;
+					tag = "DROP CONVERSION";
 					break;
 				case OBJECT_SCHEMA:
-					tag = CMDTAG_DROP_SCHEMA;
+					tag = "DROP SCHEMA";
 					break;
 				case OBJECT_TSPARSER:
-					tag = CMDTAG_DROP_TEXT_SEARCH_PARSER;
+					tag = "DROP TEXT SEARCH PARSER";
 					break;
 				case OBJECT_TSDICTIONARY:
-					tag = CMDTAG_DROP_TEXT_SEARCH_DICTIONARY;
+					tag = "DROP TEXT SEARCH DICTIONARY";
 					break;
 				case OBJECT_TSTEMPLATE:
-					tag = CMDTAG_DROP_TEXT_SEARCH_TEMPLATE;
+					tag = "DROP TEXT SEARCH TEMPLATE";
 					break;
 				case OBJECT_TSCONFIGURATION:
-					tag = CMDTAG_DROP_TEXT_SEARCH_CONFIGURATION;
+					tag = "DROP TEXT SEARCH CONFIGURATION";
 					break;
 				case OBJECT_FOREIGN_TABLE:
-					tag = CMDTAG_DROP_FOREIGN_TABLE;
+					tag = "DROP FOREIGN TABLE";
 					break;
 				case OBJECT_EXTENSION:
-					tag = CMDTAG_DROP_EXTENSION;
+					tag = "DROP EXTENSION";
 					break;
 				case OBJECT_FUNCTION:
-					tag = CMDTAG_DROP_FUNCTION;
+					tag = "DROP FUNCTION";
 					break;
 				case OBJECT_PROCEDURE:
-					tag = CMDTAG_DROP_PROCEDURE;
+					tag = "DROP PROCEDURE";
 					break;
 				case OBJECT_ROUTINE:
-					tag = CMDTAG_DROP_ROUTINE;
+					tag = "DROP ROUTINE";
 					break;
 				case OBJECT_AGGREGATE:
-					tag = CMDTAG_DROP_AGGREGATE;
+					tag = "DROP AGGREGATE";
 					break;
 				case OBJECT_OPERATOR:
-					tag = CMDTAG_DROP_OPERATOR;
+					tag = "DROP OPERATOR";
 					break;
 				case OBJECT_LANGUAGE:
-					tag = CMDTAG_DROP_LANGUAGE;
+					tag = "DROP LANGUAGE";
 					break;
 				case OBJECT_CAST:
-					tag = CMDTAG_DROP_CAST;
+					tag = "DROP CAST";
 					break;
 				case OBJECT_TRIGGER:
-					tag = CMDTAG_DROP_TRIGGER;
+					tag = "DROP TRIGGER";
 					break;
 				case OBJECT_EVENT_TRIGGER:
-					tag = CMDTAG_DROP_EVENT_TRIGGER;
+					tag = "DROP EVENT TRIGGER";
 					break;
 				case OBJECT_RULE:
-					tag = CMDTAG_DROP_RULE;
+					tag = "DROP RULE";
 					break;
 				case OBJECT_FDW:
-					tag = CMDTAG_DROP_FOREIGN_DATA_WRAPPER;
+					tag = "DROP FOREIGN DATA WRAPPER";
 					break;
 				case OBJECT_FOREIGN_SERVER:
-					tag = CMDTAG_DROP_SERVER;
+					tag = "DROP SERVER";
 					break;
 				case OBJECT_OPCLASS:
-					tag = CMDTAG_DROP_OPERATOR_CLASS;
+					tag = "DROP OPERATOR CLASS";
 					break;
 				case OBJECT_OPFAMILY:
-					tag = CMDTAG_DROP_OPERATOR_FAMILY;
+					tag = "DROP OPERATOR FAMILY";
 					break;
 				case OBJECT_POLICY:
-					tag = CMDTAG_DROP_POLICY;
+					tag = "DROP POLICY";
 					break;
 				case OBJECT_TRANSFORM:
-					tag = CMDTAG_DROP_TRANSFORM;
+					tag = "DROP TRANSFORM";
 					break;
 				case OBJECT_ACCESS_METHOD:
-					tag = CMDTAG_DROP_ACCESS_METHOD;
+					tag = "DROP ACCESS METHOD";
 					break;
 				case OBJECT_PUBLICATION:
-					tag = CMDTAG_DROP_PUBLICATION;
+					tag = "DROP PUBLICATION";
 					break;
 				case OBJECT_STATISTIC_EXT:
-					tag = CMDTAG_DROP_STATISTICS;
+					tag = "DROP STATISTICS";
 					break;
 				default:
-					tag = CMDTAG_UNKNOWN;
+					tag = "???";
 			}
 			break;
 
 		case T_TruncateStmt:
-			tag = CMDTAG_TRUNCATE_TABLE;
+			tag = "TRUNCATE TABLE";
 			break;
 
 		case T_CommentStmt:
-			tag = CMDTAG_COMMENT;
+			tag = "COMMENT";
 			break;
 
 		case T_SecLabelStmt:
-			tag = CMDTAG_SECURITY_LABEL;
+			tag = "SECURITY LABEL";
 			break;
 
 		case T_CopyStmt:
-			tag = CMDTAG_COPY;
+			tag = "COPY";
 			break;
 
 		case T_RenameStmt:
-
-			/*
-			 * When the column is renamed, the command tag is created from its
-			 * relation type
-			 */
-			tag = AlterObjectTypeCommandTag(((RenameStmt *) parsetree)->renameType == OBJECT_COLUMN ?
-											((RenameStmt *) parsetree)->relationType :
-											((RenameStmt *) parsetree)->renameType);
+			tag = AlterObjectTypeCommandTag(((RenameStmt *) parsetree)->renameType);
 			break;
 
 		case T_AlterObjectDependsStmt:
@@ -2578,23 +2425,23 @@ CreateCommandTag(Node *parsetree)
 			break;
 
 		case T_AlterDomainStmt:
-			tag = CMDTAG_ALTER_DOMAIN;
+			tag = "ALTER DOMAIN";
 			break;
 
 		case T_AlterFunctionStmt:
 			switch (((AlterFunctionStmt *) parsetree)->objtype)
 			{
 				case OBJECT_FUNCTION:
-					tag = CMDTAG_ALTER_FUNCTION;
+					tag = "ALTER FUNCTION";
 					break;
 				case OBJECT_PROCEDURE:
-					tag = CMDTAG_ALTER_PROCEDURE;
+					tag = "ALTER PROCEDURE";
 					break;
 				case OBJECT_ROUTINE:
-					tag = CMDTAG_ALTER_ROUTINE;
+					tag = "ALTER ROUTINE";
 					break;
 				default:
-					tag = CMDTAG_UNKNOWN;
+					tag = "???";
 			}
 			break;
 
@@ -2602,7 +2449,7 @@ CreateCommandTag(Node *parsetree)
 			{
 				GrantStmt  *stmt = (GrantStmt *) parsetree;
 
-				tag = (stmt->is_grant) ? CMDTAG_GRANT : CMDTAG_REVOKE;
+				tag = (stmt->is_grant) ? "GRANT" : "REVOKE";
 			}
 			break;
 
@@ -2610,145 +2457,145 @@ CreateCommandTag(Node *parsetree)
 			{
 				GrantRoleStmt *stmt = (GrantRoleStmt *) parsetree;
 
-				tag = (stmt->is_grant) ? CMDTAG_GRANT_ROLE : CMDTAG_REVOKE_ROLE;
+				tag = (stmt->is_grant) ? "GRANT ROLE" : "REVOKE ROLE";
 			}
 			break;
 
 		case T_AlterDefaultPrivilegesStmt:
-			tag = CMDTAG_ALTER_DEFAULT_PRIVILEGES;
+			tag = "ALTER DEFAULT PRIVILEGES";
 			break;
 
 		case T_DefineStmt:
 			switch (((DefineStmt *) parsetree)->kind)
 			{
 				case OBJECT_AGGREGATE:
-					tag = CMDTAG_CREATE_AGGREGATE;
+					tag = "CREATE AGGREGATE";
 					break;
 				case OBJECT_OPERATOR:
-					tag = CMDTAG_CREATE_OPERATOR;
+					tag = "CREATE OPERATOR";
 					break;
 				case OBJECT_TYPE:
-					tag = CMDTAG_CREATE_TYPE;
+					tag = "CREATE TYPE";
 					break;
 				case OBJECT_TSPARSER:
-					tag = CMDTAG_CREATE_TEXT_SEARCH_PARSER;
+					tag = "CREATE TEXT SEARCH PARSER";
 					break;
 				case OBJECT_TSDICTIONARY:
-					tag = CMDTAG_CREATE_TEXT_SEARCH_DICTIONARY;
+					tag = "CREATE TEXT SEARCH DICTIONARY";
 					break;
 				case OBJECT_TSTEMPLATE:
-					tag = CMDTAG_CREATE_TEXT_SEARCH_TEMPLATE;
+					tag = "CREATE TEXT SEARCH TEMPLATE";
 					break;
 				case OBJECT_TSCONFIGURATION:
-					tag = CMDTAG_CREATE_TEXT_SEARCH_CONFIGURATION;
+					tag = "CREATE TEXT SEARCH CONFIGURATION";
 					break;
 				case OBJECT_COLLATION:
-					tag = CMDTAG_CREATE_COLLATION;
+					tag = "CREATE COLLATION";
 					break;
 				case OBJECT_ACCESS_METHOD:
-					tag = CMDTAG_CREATE_ACCESS_METHOD;
+					tag = "CREATE ACCESS METHOD";
 					break;
 				default:
-					tag = CMDTAG_UNKNOWN;
+					tag = "???";
 			}
 			break;
 
 		case T_CompositeTypeStmt:
-			tag = CMDTAG_CREATE_TYPE;
+			tag = "CREATE TYPE";
 			break;
 
 		case T_CreateEnumStmt:
-			tag = CMDTAG_CREATE_TYPE;
+			tag = "CREATE TYPE";
 			break;
 
 		case T_CreateRangeStmt:
-			tag = CMDTAG_CREATE_TYPE;
+			tag = "CREATE TYPE";
 			break;
 
 		case T_AlterEnumStmt:
-			tag = CMDTAG_ALTER_TYPE;
+			tag = "ALTER TYPE";
 			break;
 
 		case T_ViewStmt:
-			tag = CMDTAG_CREATE_VIEW;
+			tag = "CREATE VIEW";
 			break;
 
 		case T_CreateFunctionStmt:
 			if (((CreateFunctionStmt *) parsetree)->is_procedure)
-				tag = CMDTAG_CREATE_PROCEDURE;
+				tag = "CREATE PROCEDURE";
 			else
-				tag = CMDTAG_CREATE_FUNCTION;
+				tag = "CREATE FUNCTION";
 			break;
 
 		case T_IndexStmt:
-			tag = CMDTAG_CREATE_INDEX;
+			tag = "CREATE INDEX";
 			break;
 
 		case T_RuleStmt:
-			tag = CMDTAG_CREATE_RULE;
+			tag = "CREATE RULE";
 			break;
 
 		case T_CreateSeqStmt:
-			tag = CMDTAG_CREATE_SEQUENCE;
+			tag = "CREATE SEQUENCE";
 			break;
 
 		case T_AlterSeqStmt:
-			tag = CMDTAG_ALTER_SEQUENCE;
+			tag = "ALTER SEQUENCE";
 			break;
 
 		case T_DoStmt:
-			tag = CMDTAG_DO;
+			tag = "DO";
 			break;
 
 		case T_CreatedbStmt:
-			tag = CMDTAG_CREATE_DATABASE;
+			tag = "CREATE DATABASE";
 			break;
 
 		case T_AlterDatabaseStmt:
-			tag = CMDTAG_ALTER_DATABASE;
+			tag = "ALTER DATABASE";
 			break;
 
 		case T_AlterDatabaseSetStmt:
-			tag = CMDTAG_ALTER_DATABASE;
+			tag = "ALTER DATABASE";
 			break;
 
 		case T_DropdbStmt:
-			tag = CMDTAG_DROP_DATABASE;
+			tag = "DROP DATABASE";
 			break;
 
 		case T_NotifyStmt:
-			tag = CMDTAG_NOTIFY;
+			tag = "NOTIFY";
 			break;
 
 		case T_ListenStmt:
-			tag = CMDTAG_LISTEN;
+			tag = "LISTEN";
 			break;
 
 		case T_UnlistenStmt:
-			tag = CMDTAG_UNLISTEN;
+			tag = "UNLISTEN";
 			break;
 
 		case T_LoadStmt:
-			tag = CMDTAG_LOAD;
+			tag = "LOAD";
 			break;
 
 		case T_CallStmt:
-			tag = CMDTAG_CALL;
+			tag = "CALL";
 			break;
 
 		case T_ClusterStmt:
-			tag = CMDTAG_CLUSTER;
+			tag = "CLUSTER";
 			break;
 
 		case T_VacuumStmt:
 			if (((VacuumStmt *) parsetree)->is_vacuumcmd)
-				tag = CMDTAG_VACUUM;
+				tag = "VACUUM";
 			else
-				tag = CMDTAG_ANALYZE;
+				tag = "ANALYZE";
 			break;
 
 		case T_ExplainStmt:
-			tag = CMDTAG_EXPLAIN;
+			tag = "EXPLAIN";
 			break;
 
 		case T_CreateTableAsStmt:
@@ -2756,24 +2603,24 @@ CreateCommandTag(Node *parsetree)
 			{
 				case OBJECT_TABLE:
 					if (((CreateTableAsStmt *) parsetree)->is_select_into)
-						tag = CMDTAG_SELECT_INTO;
+						tag = "SELECT INTO";
 					else
-						tag = CMDTAG_CREATE_TABLE_AS;
+						tag = "CREATE TABLE AS";
 					break;
 				case OBJECT_MATVIEW:
-					tag = CMDTAG_CREATE_MATERIALIZED_VIEW;
+					tag = "CREATE MATERIALIZED VIEW";
 					break;
 				default:
-					tag = CMDTAG_UNKNOWN;
+					tag = "???";
 			}
 			break;
 
 		case T_RefreshMatViewStmt:
-			tag = CMDTAG_REFRESH_MATERIALIZED_VIEW;
+			tag = "REFRESH MATERIALIZED VIEW";
 			break;
 
 		case T_AlterSystemStmt:
-			tag = CMDTAG_ALTER_SYSTEM;
+			tag = "ALTER SYSTEM";
 			break;
 
 		case T_VariableSetStmt:
@@ -2783,187 +2630,179 @@ CreateCommandTag(Node *parsetree)
 				case VAR_SET_CURRENT:
 				case VAR_SET_DEFAULT:
 				case VAR_SET_MULTI:
-					tag = CMDTAG_SET;
+					tag = "SET";
 					break;
 				case VAR_RESET:
 				case VAR_RESET_ALL:
-					tag = CMDTAG_RESET;
+					tag = "RESET";
 					break;
 				default:
-					tag = CMDTAG_UNKNOWN;
+					tag = "???";
 			}
 			break;
 
 		case T_VariableShowStmt:
-			tag = CMDTAG_SHOW;
+			tag = "SHOW";
 			break;
 
 		case T_DiscardStmt:
 			switch (((DiscardStmt *) parsetree)->target)
 			{
 				case DISCARD_ALL:
-					tag = CMDTAG_DISCARD_ALL;
+					tag = "DISCARD ALL";
 					break;
 				case DISCARD_PLANS:
-					tag = CMDTAG_DISCARD_PLANS;
+					tag = "DISCARD PLANS";
 					break;
 				case DISCARD_TEMP:
-					tag = CMDTAG_DISCARD_TEMP;
+					tag = "DISCARD TEMP";
 					break;
 				case DISCARD_SEQUENCES:
-					tag = CMDTAG_DISCARD_SEQUENCES;
+					tag = "DISCARD SEQUENCES";
 					break;
 				default:
-					tag = CMDTAG_UNKNOWN;
+					tag = "???";
 			}
 			break;
 
 		case T_CreateTransformStmt:
-			tag = CMDTAG_CREATE_TRANSFORM;
+			tag = "CREATE TRANSFORM";
 			break;
 
 		case T_CreateTrigStmt:
-			tag = CMDTAG_CREATE_TRIGGER;
+			tag = "CREATE TRIGGER";
 			break;
 
 		case T_CreateEventTrigStmt:
-			tag = CMDTAG_CREATE_EVENT_TRIGGER;
+			tag = "CREATE EVENT TRIGGER";
 			break;
 
 		case T_AlterEventTrigStmt:
-			tag = CMDTAG_ALTER_EVENT_TRIGGER;
+			tag = "ALTER EVENT TRIGGER";
 			break;
 
 		case T_CreatePLangStmt:
-			tag = CMDTAG_CREATE_LANGUAGE;
+			tag = "CREATE LANGUAGE";
 			break;
 
 		case T_CreateRoleStmt:
-			tag = CMDTAG_CREATE_ROLE;
+			tag = "CREATE ROLE";
 			break;
 
 		case T_AlterRoleStmt:
-			tag = CMDTAG_ALTER_ROLE;
+			tag = "ALTER ROLE";
 			break;
 
 		case T_AlterRoleSetStmt:
-			tag = CMDTAG_ALTER_ROLE;
+			tag = "ALTER ROLE";
 			break;
 
 		case T_DropRoleStmt:
-			tag = CMDTAG_DROP_ROLE;
+			tag = "DROP ROLE";
 			break;
 
 		case T_DropOwnedStmt:
-			tag = CMDTAG_DROP_OWNED;
+			tag = "DROP OWNED";
 			break;
 
 		case T_ReassignOwnedStmt:
-			tag = CMDTAG_REASSIGN_OWNED;
+			tag = "REASSIGN OWNED";
 			break;
 
 		case T_LockStmt:
-			tag = CMDTAG_LOCK_TABLE;
+			tag = "LOCK TABLE";
 			break;
 
 		case T_ConstraintsSetStmt:
-			tag = CMDTAG_SET_CONSTRAINTS;
+			tag = "SET CONSTRAINTS";
 			break;
 
 		case T_CheckPointStmt:
-			tag = CMDTAG_CHECKPOINT;
+			tag = "CHECKPOINT";
 			break;
 
 		case T_ReindexStmt:
-			tag = CMDTAG_REINDEX;
+			tag = "REINDEX";
 			break;
 
 		case T_CreateConversionStmt:
-			tag = CMDTAG_CREATE_CONVERSION;
+			tag = "CREATE CONVERSION";
 			break;
 
 		case T_CreateCastStmt:
-			tag = CMDTAG_CREATE_CAST;
+			tag = "CREATE CAST";
 			break;
 
 		case T_CreateOpClassStmt:
-			tag = CMDTAG_CREATE_OPERATOR_CLASS;
+			tag = "CREATE OPERATOR CLASS";
 			break;
 
 		case T_CreateOpFamilyStmt:
-			tag = CMDTAG_CREATE_OPERATOR_FAMILY;
+			tag = "CREATE OPERATOR FAMILY";
 			break;
 
 		case T_AlterOpFamilyStmt:
-			tag = CMDTAG_ALTER_OPERATOR_FAMILY;
+			tag = "ALTER OPERATOR FAMILY";
 			break;
 
 		case T_AlterOperatorStmt:
-			tag = CMDTAG_ALTER_OPERATOR;
-			break;
-
-		case T_AlterTypeStmt:
-			tag = CMDTAG_ALTER_TYPE;
+			tag = "ALTER OPERATOR";
 			break;
 
 		case T_AlterTSDictionaryStmt:
-			tag = CMDTAG_ALTER_TEXT_SEARCH_DICTIONARY;
+			tag = "ALTER TEXT SEARCH DICTIONARY";
 			break;
 
 		case T_AlterTSConfigurationStmt:
-			tag = CMDTAG_ALTER_TEXT_SEARCH_CONFIGURATION;
+			tag = "ALTER TEXT SEARCH CONFIGURATION";
 			break;
 
 		case T_CreatePolicyStmt:
-			tag = CMDTAG_CREATE_POLICY;
+			tag = "CREATE POLICY";
 			break;
 
 		case T_AlterPolicyStmt:
-			tag = CMDTAG_ALTER_POLICY;
+			tag = "ALTER POLICY";
 			break;
 
 		case T_CreateAmStmt:
-			tag = CMDTAG_CREATE_ACCESS_METHOD;
+			tag = "CREATE ACCESS METHOD";
 			break;
 
 		case T_CreatePublicationStmt:
-			tag = CMDTAG_CREATE_PUBLICATION;
+			tag = "CREATE PUBLICATION";
 			break;
 
 		case T_AlterPublicationStmt:
-			tag = CMDTAG_ALTER_PUBLICATION;
+			tag = "ALTER PUBLICATION";
 			break;
 
 		case T_CreateSubscriptionStmt:
-			tag = CMDTAG_CREATE_SUBSCRIPTION;
+			tag = "CREATE SUBSCRIPTION";
 			break;
 
 		case T_AlterSubscriptionStmt:
-			tag = CMDTAG_ALTER_SUBSCRIPTION;
+			tag = "ALTER SUBSCRIPTION";
 			break;
 
 		case T_DropSubscriptionStmt:
-			tag = CMDTAG_DROP_SUBSCRIPTION;
+			tag = "DROP SUBSCRIPTION";
 			break;
 
 		case T_AlterCollationStmt:
-			tag = CMDTAG_ALTER_COLLATION;
+			tag = "ALTER COLLATION";
 			break;
 
 		case T_PrepareStmt:
-			tag = CMDTAG_PREPARE;
+			tag = "PREPARE";
 			break;
 
 		case T_ExecuteStmt:
-			tag = CMDTAG_EXECUTE;
+			tag = "EXECUTE";
 			break;
 
 		case T_CreateStatsStmt:
-			tag = CMDTAG_CREATE_STATISTICS;
-			break;
-
-		case T_AlterStatsStmt:
-			tag = CMDTAG_ALTER_STATISTICS;
+			tag = "CREATE STATISTICS";
 			break;
 
 		case T_DeallocateStmt:
@@ -2971,9 +2810,9 @@ CreateCommandTag(Node *parsetree)
 				DeallocateStmt *stmt = (DeallocateStmt *) parsetree;
 
 				if (stmt->name == NULL)
-					tag = CMDTAG_DEALLOCATE_ALL;
+					tag = "DEALLOCATE ALL";
 				else
-					tag = CMDTAG_DEALLOCATE;
+					tag = "DEALLOCATE";
 			}
 			break;
 
@@ -2997,33 +2836,33 @@ CreateCommandTag(Node *parsetree)
 							switch (((PlanRowMark *) linitial(stmt->rowMarks))->strength)
 							{
 								case LCS_FORKEYSHARE:
-									tag = CMDTAG_SELECT_FOR_KEY_SHARE;
+									tag = "SELECT FOR KEY SHARE";
 									break;
 								case LCS_FORSHARE:
-									tag = CMDTAG_SELECT_FOR_SHARE;
+									tag = "SELECT FOR SHARE";
 									break;
 								case LCS_FORNOKEYUPDATE:
-									tag = CMDTAG_SELECT_FOR_NO_KEY_UPDATE;
+									tag = "SELECT FOR NO KEY UPDATE";
 									break;
 								case LCS_FORUPDATE:
-									tag = CMDTAG_SELECT_FOR_UPDATE;
+									tag = "SELECT FOR UPDATE";
 									break;
 								default:
-									tag = CMDTAG_SELECT;
+									tag = "SELECT";
 									break;
 							}
 						}
 						else
-							tag = CMDTAG_SELECT;
+							tag = "SELECT";
 						break;
 					case CMD_UPDATE:
-						tag = CMDTAG_UPDATE;
+						tag = "UPDATE";
 						break;
 					case CMD_INSERT:
-						tag = CMDTAG_INSERT;
+						tag = "INSERT";
 						break;
 					case CMD_DELETE:
-						tag = CMDTAG_DELETE;
+						tag = "DELETE";
 						break;
 					case CMD_UTILITY:
 						tag = CreateCommandTag(stmt->utilityStmt);
@@ -3031,7 +2870,7 @@ CreateCommandTag(Node *parsetree)
 					default:
 						elog(WARNING, "unrecognized commandType: %d",
 							 (int) stmt->commandType);
-						tag = CMDTAG_UNKNOWN;
+						tag = "???";
 						break;
 				}
 			}
@@ -3057,33 +2896,33 @@ CreateCommandTag(Node *parsetree)
 							switch (((RowMarkClause *) linitial(stmt->rowMarks))->strength)
 							{
 								case LCS_FORKEYSHARE:
-									tag = CMDTAG_SELECT_FOR_KEY_SHARE;
+									tag = "SELECT FOR KEY SHARE";
 									break;
 								case LCS_FORSHARE:
-									tag = CMDTAG_SELECT_FOR_SHARE;
+									tag = "SELECT FOR SHARE";
 									break;
 								case LCS_FORNOKEYUPDATE:
-									tag = CMDTAG_SELECT_FOR_NO_KEY_UPDATE;
+									tag = "SELECT FOR NO KEY UPDATE";
 									break;
 								case LCS_FORUPDATE:
-									tag = CMDTAG_SELECT_FOR_UPDATE;
+									tag = "SELECT FOR UPDATE";
 									break;
 								default:
-									tag = CMDTAG_UNKNOWN;
+									tag = "???";
 									break;
 							}
 						}
 						else
-							tag = CMDTAG_SELECT;
+							tag = "SELECT";
 						break;
 					case CMD_UPDATE:
-						tag = CMDTAG_UPDATE;
+						tag = "UPDATE";
 						break;
 					case CMD_INSERT:
-						tag = CMDTAG_INSERT;
+						tag = "INSERT";
 						break;
 					case CMD_DELETE:
-						tag = CMDTAG_DELETE;
+						tag = "DELETE";
 						break;
 					case CMD_UTILITY:
 						tag = CreateCommandTag(stmt->utilityStmt);
@@ -3091,7 +2930,7 @@ CreateCommandTag(Node *parsetree)
 					default:
 						elog(WARNING, "unrecognized commandType: %d",
 							 (int) stmt->commandType);
-						tag = CMDTAG_UNKNOWN;
+						tag = "???";
 						break;
 				}
 			}
@@ -3100,7 +2939,7 @@ CreateCommandTag(Node *parsetree)
 		default:
 			elog(WARNING, "unrecognized node type: %d",
 				 (int) nodeTag(parsetree));
-			tag = CMDTAG_UNKNOWN;
+			tag = "???";
 			break;
 	}
 
@@ -3259,10 +3098,6 @@ GetCommandLogLevel(Node *parsetree)
 			break;
 
 		case T_AlterOperatorStmt:
-			lev = LOGSTMT_DDL;
-			break;
-
-		case T_AlterTypeStmt:
 			lev = LOGSTMT_DDL;
 			break;
 
@@ -3555,10 +3390,6 @@ GetCommandLogLevel(Node *parsetree)
 			break;
 
 		case T_CreateStatsStmt:
-			lev = LOGSTMT_DDL;
-			break;
-
-		case T_AlterStatsStmt:
 			lev = LOGSTMT_DDL;
 			break;
 

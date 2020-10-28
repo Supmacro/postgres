@@ -3,7 +3,7 @@
  * pl_exec.c		- Executor for the PL/pgSQL
  *			  procedural language
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,10 +17,10 @@
 
 #include <ctype.h>
 
-#include "access/detoast.h"
 #include "access/htup_details.h"
 #include "access/transam.h"
 #include "access/tupconvert.h"
+#include "access/tuptoaster.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
@@ -28,16 +28,13 @@
 #include "executor/spi.h"
 #include "executor/spi_priv.h"
 #include "funcapi.h"
-#include "mb/stringinfo_mb.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/optimizer.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_type.h"
 #include "parser/scansup.h"
-#include "plpgsql.h"
 #include "storage/proc.h"
-#include "tcop/cmdtag.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/array.h"
@@ -50,6 +47,9 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
+
+#include "plpgsql.h"
+
 
 typedef struct
 {
@@ -101,16 +101,6 @@ typedef struct SimpleEcontextStackEntry
 
 static EState *shared_simple_eval_estate = NULL;
 static SimpleEcontextStackEntry *simple_econtext_stack = NULL;
-
-/*
- * In addition to the shared simple-eval EState, we have a shared resource
- * owner that holds refcounts on the CachedPlans for any "simple" expressions
- * we have evaluated in the current transaction.  This allows us to avoid
- * continually grabbing and releasing a plan refcount when a simple expression
- * is used over and over.  (DO blocks use their own resowner, in exactly the
- * same way described above for shared_simple_eval_estate.)
- */
-static ResourceOwner shared_simple_eval_resowner = NULL;
 
 /*
  * Memory management within a plpgsql function generally works with three
@@ -331,8 +321,7 @@ static int	exec_stmt_set(PLpgSQL_execstate *estate,
 static void plpgsql_estate_setup(PLpgSQL_execstate *estate,
 								 PLpgSQL_function *func,
 								 ReturnSetInfo *rsi,
-								 EState *simple_eval_estate,
-								 ResourceOwner simple_eval_resowner);
+								 EState *simple_eval_estate);
 static void exec_eval_cleanup(PLpgSQL_execstate *estate);
 
 static void exec_prepare_plan(PLpgSQL_execstate *estate,
@@ -458,19 +447,16 @@ static char *format_preparedparamsdata(PLpgSQL_execstate *estate,
  *
  * This is also used to execute inline code blocks (DO blocks).  The only
  * difference that this code is aware of is that for a DO block, we want
- * to use a private simple_eval_estate and a private simple_eval_resowner,
- * which are created and passed in by the caller.  For regular functions,
- * pass NULL, which implies using shared_simple_eval_estate and
- * shared_simple_eval_resowner.  (When using a private simple_eval_estate,
+ * to use a private simple_eval_estate, which is created and passed in by
+ * the caller.  For regular functions, pass NULL, which implies using
+ * shared_simple_eval_estate.  (When using a private simple_eval_estate,
  * we must also use a private cast hashtable, but that's taken care of
  * within plpgsql_estate_setup.)
  * ----------
  */
 Datum
 plpgsql_exec_function(PLpgSQL_function *func, FunctionCallInfo fcinfo,
-					  EState *simple_eval_estate,
-					  ResourceOwner simple_eval_resowner,
-					  bool atomic)
+					  EState *simple_eval_estate, bool atomic)
 {
 	PLpgSQL_execstate estate;
 	ErrorContextCallback plerrcontext;
@@ -481,7 +467,7 @@ plpgsql_exec_function(PLpgSQL_function *func, FunctionCallInfo fcinfo,
 	 * Setup the execution state
 	 */
 	plpgsql_estate_setup(&estate, func, (ReturnSetInfo *) fcinfo->resultinfo,
-						 simple_eval_estate, simple_eval_resowner);
+						 simple_eval_estate);
 	estate.atomic = atomic;
 
 	/*
@@ -918,7 +904,7 @@ plpgsql_exec_trigger(PLpgSQL_function *func,
 	/*
 	 * Setup the execution state
 	 */
-	plpgsql_estate_setup(&estate, func, NULL, NULL, NULL);
+	plpgsql_estate_setup(&estate, func, NULL, NULL);
 	estate.trigdata = trigdata;
 
 	/*
@@ -1156,7 +1142,7 @@ plpgsql_exec_event_trigger(PLpgSQL_function *func, EventTriggerData *trigdata)
 	/*
 	 * Setup the execution state
 	 */
-	plpgsql_estate_setup(&estate, func, NULL, NULL, NULL);
+	plpgsql_estate_setup(&estate, func, NULL, NULL);
 	estate.evtrigdata = trigdata;
 
 	/*
@@ -1212,6 +1198,8 @@ plpgsql_exec_event_trigger(PLpgSQL_function *func, EventTriggerData *trigdata)
 	 * Pop the error context stack
 	 */
 	error_context_stack = plerrcontext.previous;
+
+	return;
 }
 
 /*
@@ -1477,7 +1465,7 @@ plpgsql_fulfill_promise(PLpgSQL_execstate *estate,
 								  PointerGetDatum(construct_md_array(elems, NULL,
 																	 1, dims, lbs,
 																	 TEXTOID,
-																	 -1, false, TYPALIGN_INT)),
+																	 -1, false, 'i')),
 								  false, true);
 			}
 			else
@@ -1495,7 +1483,7 @@ plpgsql_fulfill_promise(PLpgSQL_execstate *estate,
 		case PLPGSQL_PROMISE_TG_TAG:
 			if (estate->evtrigdata == NULL)
 				elog(ERROR, "event trigger promise is not in an event trigger function");
-			assign_text_var(estate, var, GetCommandTagName(estate->evtrigdata->tag));
+			assign_text_var(estate, var, estate->evtrigdata->tag);
 			break;
 
 		default:
@@ -2340,7 +2328,6 @@ exec_stmt_call(PLpgSQL_execstate *estate, PLpgSQL_stmt_call *stmt)
 		 * simple-expression infrastructure.
 		 */
 		estate->simple_eval_estate = NULL;
-		estate->simple_eval_resowner = NULL;
 		plpgsql_create_econtext(estate);
 	}
 
@@ -3317,10 +3304,10 @@ exec_stmt_return_next(PLpgSQL_execstate *estate,
 	 * reference; in particular, this path is always taken in functions with
 	 * one or more OUT parameters.
 	 *
-	 * Unlike exec_stmt_return, there's no special win here for R/W expanded
-	 * values, since they'll have to get flattened to go into the tuplestore.
-	 * Indeed, we'd better make them R/O to avoid any risk of the casting step
-	 * changing them in-place.
+	 * Unlike exec_statement_return, there's no special win here for R/W
+	 * expanded values, since they'll have to get flattened to go into the
+	 * tuplestore.  Indeed, we'd better make them R/O to avoid any risk of the
+	 * casting step changing them in-place.
 	 */
 	if (stmt->retvarno >= 0)
 	{
@@ -3727,7 +3714,7 @@ exec_stmt_raise(PLpgSQL_execstate *estate, PLpgSQL_stmt_raise *stmt)
 													 paramvalue,
 													 paramtypeid);
 				appendStringInfoString(&ds, extval);
-				current_param = lnext(stmt->params, current_param);
+				current_param = lnext(current_param);
 				exec_eval_cleanup(estate);
 			}
 			else
@@ -3896,8 +3883,7 @@ static void
 plpgsql_estate_setup(PLpgSQL_execstate *estate,
 					 PLpgSQL_function *func,
 					 ReturnSetInfo *rsi,
-					 EState *simple_eval_estate,
-					 ResourceOwner simple_eval_resowner)
+					 EState *simple_eval_estate)
 {
 	HASHCTL		ctl;
 
@@ -3988,11 +3974,6 @@ plpgsql_estate_setup(PLpgSQL_execstate *estate,
 		estate->cast_hash = shared_cast_hash;
 		estate->cast_hash_context = shared_cast_context;
 	}
-	/* likewise for the simple-expression resource owner */
-	if (simple_eval_resowner)
-		estate->simple_eval_resowner = simple_eval_resowner;
-	else
-		estate->simple_eval_resowner = shared_simple_eval_resowner;
 
 	/*
 	 * We start with no stmt_mcontext; one will be created only if needed.
@@ -4144,9 +4125,10 @@ exec_stmt_execsql(PLpgSQL_execstate *estate,
 			 * tree(s), since those are the result of rewriting and could have
 			 * been transmogrified into something else entirely.
 			 */
-			if (plansource->commandTag == CMDTAG_INSERT ||
-				plansource->commandTag == CMDTAG_UPDATE ||
-				plansource->commandTag == CMDTAG_DELETE)
+			if (plansource->commandTag &&
+				(strcmp(plansource->commandTag, "INSERT") == 0 ||
+				 strcmp(plansource->commandTag, "UPDATE") == 0 ||
+				 strcmp(plansource->commandTag, "DELETE") == 0))
 			{
 				stmt->mod_stmt = true;
 				break;
@@ -4857,7 +4839,6 @@ exec_stmt_commit(PLpgSQL_execstate *estate, PLpgSQL_stmt_commit *stmt)
 	 * data structures are gone.
 	 */
 	estate->simple_eval_estate = NULL;
-	estate->simple_eval_resowner = NULL;
 	plpgsql_create_econtext(estate);
 
 	return PLPGSQL_RC_OK;
@@ -4884,7 +4865,6 @@ exec_stmt_rollback(PLpgSQL_execstate *estate, PLpgSQL_stmt_rollback *stmt)
 	 * data structures are gone.
 	 */
 	estate->simple_eval_estate = NULL;
-	estate->simple_eval_resowner = NULL;
 	plpgsql_create_econtext(estate);
 
 	return PLPGSQL_RC_OK;
@@ -6097,6 +6077,8 @@ loop_exit:
  * someone might redefine a SQL function that had been inlined into the simple
  * expression.  That cannot cause a simple expression to become non-simple (or
  * vice versa), but we do have to handle replacing the expression tree.
+ * Fortunately it's normally inexpensive to call SPI_plan_get_cached_plan for
+ * a simple expression.
  *
  * Note: if pass-by-reference, the result is in the eval_mcontext.
  * It will be freed when exec_eval_cleanup is done.
@@ -6112,9 +6094,8 @@ exec_eval_simple_expr(PLpgSQL_execstate *estate,
 {
 	ExprContext *econtext = estate->eval_econtext;
 	LocalTransactionId curlxid = MyProc->lxid;
-	ParamListInfo paramLI;
+	CachedPlan *cplan;
 	void	   *save_setup_arg;
-	bool		need_snapshot;
 	MemoryContext oldcontext;
 
 	/*
@@ -6126,91 +6107,29 @@ exec_eval_simple_expr(PLpgSQL_execstate *estate,
 	/*
 	 * If expression is in use in current xact, don't touch it.
 	 */
-	if (unlikely(expr->expr_simple_in_use) &&
-		expr->expr_simple_lxid == curlxid)
+	if (expr->expr_simple_in_use && expr->expr_simple_lxid == curlxid)
 		return false;
 
 	/*
-	 * Check to see if the cached plan has been invalidated.  If not, and this
-	 * is the first use in the current transaction, save a plan refcount in
-	 * the simple-expression resowner.
+	 * Revalidate cached plan, so that we will notice if it became stale. (We
+	 * need to hold a refcount while using the plan, anyway.)  If replanning
+	 * is needed, do that work in the eval_mcontext.
 	 */
-	if (likely(CachedPlanIsSimplyValid(expr->expr_simple_plansource,
-									   expr->expr_simple_plan,
-									   (expr->expr_simple_plan_lxid != curlxid ?
-										estate->simple_eval_resowner : NULL))))
+	oldcontext = MemoryContextSwitchTo(get_eval_mcontext(estate));
+	cplan = SPI_plan_get_cached_plan(expr->plan);
+	MemoryContextSwitchTo(oldcontext);
+
+	/*
+	 * We can't get a failure here, because the number of CachedPlanSources in
+	 * the SPI plan can't change from what exec_simple_check_plan saw; it's a
+	 * property of the raw parsetree generated from the query text.
+	 */
+	Assert(cplan != NULL);
+
+	/* If it got replanned, update our copy of the simple expression */
+	if (cplan->generation != expr->expr_simple_generation)
 	{
-		/*
-		 * It's still good, so just remember that we have a refcount on the
-		 * plan in the current transaction.  (If we already had one, this
-		 * assignment is a no-op.)
-		 */
-		expr->expr_simple_plan_lxid = curlxid;
-	}
-	else
-	{
-		/* Need to replan */
-		CachedPlan *cplan;
-
-		/*
-		 * If we have a valid refcount on some previous version of the plan,
-		 * release it, so we don't leak plans intra-transaction.
-		 */
-		if (expr->expr_simple_plan_lxid == curlxid)
-		{
-			ResourceOwner saveResourceOwner = CurrentResourceOwner;
-
-			CurrentResourceOwner = estate->simple_eval_resowner;
-			ReleaseCachedPlan(expr->expr_simple_plan, true);
-			CurrentResourceOwner = saveResourceOwner;
-			expr->expr_simple_plan = NULL;
-			expr->expr_simple_plan_lxid = InvalidLocalTransactionId;
-		}
-
-		/* Do the replanning work in the eval_mcontext */
-		oldcontext = MemoryContextSwitchTo(get_eval_mcontext(estate));
-		cplan = SPI_plan_get_cached_plan(expr->plan);
-		MemoryContextSwitchTo(oldcontext);
-
-		/*
-		 * We can't get a failure here, because the number of
-		 * CachedPlanSources in the SPI plan can't change from what
-		 * exec_simple_check_plan saw; it's a property of the raw parsetree
-		 * generated from the query text.
-		 */
-		Assert(cplan != NULL);
-
-		/*
-		 * This test probably can't fail either, but if it does, cope by
-		 * declaring the plan to be non-simple.  On success, we'll acquire a
-		 * refcount on the new plan, stored in simple_eval_resowner.
-		 */
-		if (CachedPlanAllowsSimpleValidityCheck(expr->expr_simple_plansource,
-												cplan,
-												estate->simple_eval_resowner))
-		{
-			/* Remember that we have the refcount */
-			expr->expr_simple_plan = cplan;
-			expr->expr_simple_plan_lxid = curlxid;
-		}
-		else
-		{
-			/* Release SPI_plan_get_cached_plan's refcount */
-			ReleaseCachedPlan(cplan, true);
-			/* Mark expression as non-simple, and fail */
-			expr->expr_simple_expr = NULL;
-			return false;
-		}
-
-		/*
-		 * SPI_plan_get_cached_plan acquired a plan refcount stored in the
-		 * active resowner.  We don't need that anymore, so release it.
-		 */
-		ReleaseCachedPlan(cplan, true);
-
-		/* Extract desired scalar expression from cached plan */
 		exec_save_simple_expr(expr, cplan);
-
 		/* better recheck r/w safety, as it could change due to inlining */
 		if (expr->rwparam >= 0)
 			exec_check_rw_parameter(expr, expr->rwparam);
@@ -6226,24 +6145,16 @@ exec_eval_simple_expr(PLpgSQL_execstate *estate,
 	 * Set up ParamListInfo to pass to executor.  For safety, save and restore
 	 * estate->paramLI->parserSetupArg around our use of the param list.
 	 */
-	paramLI = estate->paramLI;
-	save_setup_arg = paramLI->parserSetupArg;
+	save_setup_arg = estate->paramLI->parserSetupArg;
 
-	/*
-	 * We can skip using setup_param_list() in favor of just doing this
-	 * unconditionally, because there's no need for the optimization of
-	 * possibly setting ecxt_param_list_info to NULL; we've already forced use
-	 * of a generic plan.
-	 */
-	paramLI->parserSetupArg = (void *) expr;
-	econtext->ecxt_param_list_info = paramLI;
+	econtext->ecxt_param_list_info = setup_param_list(estate, expr);
 
 	/*
 	 * Prepare the expression for execution, if it's not been done already in
 	 * the current transaction.  (This will be forced to happen if we called
 	 * exec_save_simple_expr above.)
 	 */
-	if (unlikely(expr->expr_simple_lxid != curlxid))
+	if (expr->expr_simple_lxid != curlxid)
 	{
 		oldcontext = MemoryContextSwitchTo(estate->simple_eval_estate->es_query_cxt);
 		expr->expr_simple_state =
@@ -6256,19 +6167,12 @@ exec_eval_simple_expr(PLpgSQL_execstate *estate,
 
 	/*
 	 * We have to do some of the things SPI_execute_plan would do, in
-	 * particular push a new snapshot so that stable functions within the
-	 * expression can see updates made so far by our own function.  However,
-	 * we can skip doing that (and just invoke the expression with the same
-	 * snapshot passed to our function) in some cases, which is useful because
-	 * it's quite expensive relative to the cost of a simple expression.  We
-	 * can skip it if the expression contains no stable or volatile functions;
-	 * immutable functions shouldn't need to see our updates.  Also, if this
-	 * is a read-only function, we haven't made any updates so again it's okay
-	 * to skip.
+	 * particular advance the snapshot if we are in a non-read-only function.
+	 * Without this, stable functions within the expression would fail to see
+	 * updates made so far by our own function.
 	 */
 	oldcontext = MemoryContextSwitchTo(get_eval_mcontext(estate));
-	need_snapshot = (expr->expr_simple_mutable && !estate->readonly_func);
-	if (need_snapshot)
+	if (!estate->readonly_func)
 	{
 		CommandCounterIncrement();
 		PushActiveSnapshot(GetTransactionSnapshot());
@@ -6291,12 +6195,17 @@ exec_eval_simple_expr(PLpgSQL_execstate *estate,
 
 	econtext->ecxt_param_list_info = NULL;
 
-	paramLI->parserSetupArg = save_setup_arg;
+	estate->paramLI->parserSetupArg = save_setup_arg;
 
-	if (need_snapshot)
+	if (!estate->readonly_func)
 		PopActiveSnapshot();
 
 	MemoryContextSwitchTo(oldcontext);
+
+	/*
+	 * Now we can release our refcount on the cached plan.
+	 */
+	ReleaseCachedPlan(cplan, true);
 
 	/*
 	 * That's it.
@@ -8085,28 +7994,10 @@ exec_simple_check_plan(PLpgSQL_execstate *estate, PLpgSQL_expr *expr)
 	/* Can't fail, because we checked for a single CachedPlanSource above */
 	Assert(cplan != NULL);
 
-	/*
-	 * Verify that plancache.c thinks the plan is simple enough to use
-	 * CachedPlanIsSimplyValid.  Given the restrictions above, it's unlikely
-	 * that this could fail, but if it does, just treat plan as not simple. On
-	 * success, save a refcount on the plan in the simple-expression resowner.
-	 */
-	if (CachedPlanAllowsSimpleValidityCheck(plansource, cplan,
-											estate->simple_eval_resowner))
-	{
-		/* Remember that we have the refcount */
-		expr->expr_simple_plansource = plansource;
-		expr->expr_simple_plan = cplan;
-		expr->expr_simple_plan_lxid = MyProc->lxid;
+	/* Share the remaining work with replan code path */
+	exec_save_simple_expr(expr, cplan);
 
-		/* Share the remaining work with the replan code path */
-		exec_save_simple_expr(expr, cplan);
-	}
-
-	/*
-	 * Release the plan refcount obtained by SPI_plan_get_cached_plan.  (This
-	 * refcount is held by the wrong resowner, so we can't just repurpose it.)
-	 */
+	/* Release our plan refcount */
 	ReleaseCachedPlan(cplan, true);
 }
 
@@ -8164,8 +8055,8 @@ exec_save_simple_expr(PLpgSQL_expr *expr, CachedPlan *cplan)
 			if (IsA(tle_expr, Const))
 				break;
 			/* Otherwise, it had better be a Param or an outer Var */
-			Assert(IsA(tle_expr, Param) || (IsA(tle_expr, Var) &&
-											((Var *) tle_expr)->varno == OUTER_VAR));
+			Assert(IsA(tle_expr, Param) ||(IsA(tle_expr, Var) &&
+										   ((Var *) tle_expr)->varno == OUTER_VAR));
 			/* Descend to the child node */
 			plan = plan->lefttree;
 		}
@@ -8179,14 +8070,13 @@ exec_save_simple_expr(PLpgSQL_expr *expr, CachedPlan *cplan)
 	 * current transaction".
 	 */
 	expr->expr_simple_expr = tle_expr;
+	expr->expr_simple_generation = cplan->generation;
 	expr->expr_simple_state = NULL;
 	expr->expr_simple_in_use = false;
 	expr->expr_simple_lxid = InvalidLocalTransactionId;
 	/* Also stash away the expression result type */
 	expr->expr_simple_type = exprType((Node *) tle_expr);
 	expr->expr_simple_typmod = exprTypmod((Node *) tle_expr);
-	/* We also want to remember if it is immutable or not */
-	expr->expr_simple_mutable = contain_mutable_functions((Node *) tle_expr);
 }
 
 /*
@@ -8314,7 +8204,7 @@ exec_set_found(PLpgSQL_execstate *estate, bool state)
  *
  * We may need to create a new shared_simple_eval_estate too, if there's not
  * one already for the current transaction.  The EState will be cleaned up at
- * transaction end.  Ditto for shared_simple_eval_resowner.
+ * transaction end.
  */
 static void
 plpgsql_create_econtext(PLpgSQL_execstate *estate)
@@ -8345,18 +8235,6 @@ plpgsql_create_econtext(PLpgSQL_execstate *estate)
 			MemoryContextSwitchTo(oldcontext);
 		}
 		estate->simple_eval_estate = shared_simple_eval_estate;
-	}
-
-	/*
-	 * Likewise for the simple-expression resource owner.
-	 */
-	if (estate->simple_eval_resowner == NULL)
-	{
-		if (shared_simple_eval_resowner == NULL)
-			shared_simple_eval_resowner =
-				ResourceOwnerCreate(TopTransactionResourceOwner,
-									"PL/pgSQL simple expressions");
-		estate->simple_eval_resowner = shared_simple_eval_resowner;
 	}
 
 	/*
@@ -8405,20 +8283,16 @@ plpgsql_destroy_econtext(PLpgSQL_execstate *estate)
  * plpgsql_xact_cb --- post-transaction-commit-or-abort cleanup
  *
  * If a simple-expression EState was created in the current transaction,
- * it has to be cleaned up.  The same for the simple-expression resowner.
+ * it has to be cleaned up.
  */
 void
 plpgsql_xact_cb(XactEvent event, void *arg)
 {
 	/*
-	 * If we are doing a clean transaction shutdown, free the EState and tell
-	 * the resowner to release whatever plancache references it has, so that
-	 * all remaining resources will be released correctly.  (We don't need to
-	 * actually delete the resowner here; deletion of the
-	 * TopTransactionResourceOwner will take care of that.)
-	 *
-	 * In an abort, we expect the regular abort recovery procedures to release
-	 * everything of interest, so just clear our pointers.
+	 * If we are doing a clean transaction shutdown, free the EState (so that
+	 * any remaining resources will be released correctly). In an abort, we
+	 * expect the regular abort recovery procedures to release everything of
+	 * interest.
 	 */
 	if (event == XACT_EVENT_COMMIT ||
 		event == XACT_EVENT_PARALLEL_COMMIT ||
@@ -8429,16 +8303,12 @@ plpgsql_xact_cb(XactEvent event, void *arg)
 		if (shared_simple_eval_estate)
 			FreeExecutorState(shared_simple_eval_estate);
 		shared_simple_eval_estate = NULL;
-		if (shared_simple_eval_resowner)
-			ResourceOwnerReleaseAllPlanCacheRefs(shared_simple_eval_resowner);
-		shared_simple_eval_resowner = NULL;
 	}
 	else if (event == XACT_EVENT_ABORT ||
 			 event == XACT_EVENT_PARALLEL_ABORT)
 	{
 		simple_econtext_stack = NULL;
 		shared_simple_eval_estate = NULL;
-		shared_simple_eval_resowner = NULL;
 	}
 }
 
@@ -8506,7 +8376,7 @@ assign_simple_var(PLpgSQL_execstate *estate, PLpgSQL_var *var,
 		 * pain, but there's little choice.
 		 */
 		oldcxt = MemoryContextSwitchTo(get_eval_mcontext(estate));
-		detoasted = PointerGetDatum(detoast_external_attr((struct varlena *) DatumGetPointer(newvalue)));
+		detoasted = PointerGetDatum(heap_tuple_fetch_attr((struct varlena *) DatumGetPointer(newvalue)));
 		MemoryContextSwitchTo(oldcxt);
 		/* Now's a good time to not leak the input value if it's freeable */
 		if (freeable)
@@ -8767,11 +8637,19 @@ format_expr_params(PLpgSQL_execstate *estate,
 		if (paramisnull)
 			appendStringInfoString(&paramstr, "NULL");
 		else
-			appendStringInfoStringQuoted(&paramstr,
-										 convert_value_to_string(estate,
-																 paramdatum,
-																 paramtypeid),
-										 -1);
+		{
+			char	   *value = convert_value_to_string(estate, paramdatum, paramtypeid);
+			char	   *p;
+
+			appendStringInfoCharMacro(&paramstr, '\'');
+			for (p = value; *p; p++)
+			{
+				if (*p == '\'') /* double single quotes */
+					appendStringInfoCharMacro(&paramstr, *p);
+				appendStringInfoCharMacro(&paramstr, *p);
+			}
+			appendStringInfoCharMacro(&paramstr, '\'');
+		}
 
 		paramno++;
 	}
@@ -8809,11 +8687,19 @@ format_preparedparamsdata(PLpgSQL_execstate *estate,
 		if (ppd->nulls[paramno] == 'n')
 			appendStringInfoString(&paramstr, "NULL");
 		else
-			appendStringInfoStringQuoted(&paramstr,
-										 convert_value_to_string(estate,
-																 ppd->values[paramno],
-																 ppd->types[paramno]),
-										 -1);
+		{
+			char	   *value = convert_value_to_string(estate, ppd->values[paramno], ppd->types[paramno]);
+			char	   *p;
+
+			appendStringInfoCharMacro(&paramstr, '\'');
+			for (p = value; *p; p++)
+			{
+				if (*p == '\'') /* double single quotes */
+					appendStringInfoCharMacro(&paramstr, *p);
+				appendStringInfoCharMacro(&paramstr, *p);
+			}
+			appendStringInfoCharMacro(&paramstr, '\'');
+		}
 	}
 
 	MemoryContextSwitchTo(oldcontext);

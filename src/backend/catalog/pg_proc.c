@@ -3,7 +3,7 @@
  * pg_proc.c
  *	  routines to support manipulation of the pg_proc relation
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -32,7 +32,6 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
-#include "parser/parse_coerce.h"
 #include "parser/parse_type.h"
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
@@ -98,6 +97,12 @@ ProcedureCreate(const char *procedureName,
 	int			allParamCount;
 	Oid		   *allParams;
 	char	   *paramModes = NULL;
+	bool		genericInParam = false;
+	bool		genericOutParam = false;
+	bool		anyrangeInParam = false;
+	bool		anyrangeOutParam = false;
+	bool		internalInParam = false;
+	bool		internalOutParam = false;
 	Oid			variadicType = InvalidOid;
 	Acl		   *proacl = NULL;
 	Relation	rel;
@@ -111,7 +116,6 @@ ProcedureCreate(const char *procedureName,
 	bool		is_update;
 	ObjectAddress myself,
 				referenced;
-	char	   *detailmsg;
 	int			i;
 	Oid			trfid;
 
@@ -174,34 +178,29 @@ ProcedureCreate(const char *procedureName,
 	}
 
 	/*
-	 * Do not allow polymorphic return type unless there is a polymorphic
-	 * input argument that we can use to deduce the actual return type.
+	 * Detect whether we have polymorphic or INTERNAL arguments.  The first
+	 * loop checks input arguments, the second output arguments.
 	 */
-	detailmsg = check_valid_polymorphic_signature(returnType,
-												  parameterTypes->values,
-												  parameterCount);
-	if (detailmsg)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-				 errmsg("cannot determine result data type"),
-				 errdetail_internal("%s", detailmsg)));
+	for (i = 0; i < parameterCount; i++)
+	{
+		switch (parameterTypes->values[i])
+		{
+			case ANYARRAYOID:
+			case ANYELEMENTOID:
+			case ANYNONARRAYOID:
+			case ANYENUMOID:
+				genericInParam = true;
+				break;
+			case ANYRANGEOID:
+				genericInParam = true;
+				anyrangeInParam = true;
+				break;
+			case INTERNALOID:
+				internalInParam = true;
+				break;
+		}
+	}
 
-	/*
-	 * Also, do not allow return type INTERNAL unless at least one input
-	 * argument is INTERNAL.
-	 */
-	detailmsg = check_valid_internal_signature(returnType,
-											   parameterTypes->values,
-											   parameterCount);
-	if (detailmsg)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-				 errmsg("unsafe use of pseudo-type \"internal\""),
-				 errdetail_internal("%s", detailmsg)));
-
-	/*
-	 * Apply the same tests to any OUT arguments.
-	 */
 	if (allParameterTypes != PointerGetDatum(NULL))
 	{
 		for (i = 0; i < allParamCount; i++)
@@ -211,26 +210,52 @@ ProcedureCreate(const char *procedureName,
 				paramModes[i] == PROARGMODE_VARIADIC)
 				continue;		/* ignore input-only params */
 
-			detailmsg = check_valid_polymorphic_signature(allParams[i],
-														  parameterTypes->values,
-														  parameterCount);
-			if (detailmsg)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-						 errmsg("cannot determine result data type"),
-						 errdetail_internal("%s", detailmsg)));
-			detailmsg = check_valid_internal_signature(allParams[i],
-													   parameterTypes->values,
-													   parameterCount);
-			if (detailmsg)
-				ereport(ERROR,
-						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
-						 errmsg("unsafe use of pseudo-type \"internal\""),
-						 errdetail_internal("%s", detailmsg)));
+			switch (allParams[i])
+			{
+				case ANYARRAYOID:
+				case ANYELEMENTOID:
+				case ANYNONARRAYOID:
+				case ANYENUMOID:
+					genericOutParam = true;
+					break;
+				case ANYRANGEOID:
+					genericOutParam = true;
+					anyrangeOutParam = true;
+					break;
+				case INTERNALOID:
+					internalOutParam = true;
+					break;
+			}
 		}
 	}
 
-	/* Identify variadic argument type, if any */
+	/*
+	 * Do not allow polymorphic return type unless at least one input argument
+	 * is polymorphic.  ANYRANGE return type is even stricter: must have an
+	 * ANYRANGE input (since we can't deduce the specific range type from
+	 * ANYELEMENT).  Also, do not allow return type INTERNAL unless at least
+	 * one input argument is INTERNAL.
+	 */
+	if ((IsPolymorphicType(returnType) || genericOutParam)
+		&& !genericInParam)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+				 errmsg("cannot determine result data type"),
+				 errdetail("A function returning a polymorphic type must have at least one polymorphic argument.")));
+
+	if ((returnType == ANYRANGEOID || anyrangeOutParam) &&
+		!anyrangeInParam)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+				 errmsg("cannot determine result data type"),
+				 errdetail("A function returning \"anyrange\" must have at least one \"anyrange\" argument.")));
+
+	if ((returnType == INTERNALOID || internalOutParam) && !internalInParam)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+				 errmsg("unsafe use of pseudo-type \"internal\""),
+				 errdetail("A function returning \"internal\" must have at least one \"internal\" argument.")));
+
 	if (paramModes != NULL)
 	{
 		/*
@@ -261,9 +286,6 @@ ProcedureCreate(const char *procedureName,
 							break;
 						case ANYARRAYOID:
 							variadicType = ANYELEMENTOID;
-							break;
-						case ANYCOMPATIBLEARRAYOID:
-							variadicType = ANYCOMPATIBLEOID;
 							break;
 						default:
 							variadicType = get_element_type(allParams[i]);
@@ -516,9 +538,11 @@ ProcedureCreate(const char *procedureName,
 			Assert(list_length(oldDefaults) == oldproc->pronargdefaults);
 
 			/* new list can have more defaults than old, advance over 'em */
-			newlc = list_nth_cell(parameterDefaults,
-								  list_length(parameterDefaults) -
-								  oldproc->pronargdefaults);
+			newlc = list_head(parameterDefaults);
+			for (i = list_length(parameterDefaults) - oldproc->pronargdefaults;
+				 i > 0;
+				 i--)
+				newlc = lnext(newlc);
 
 			foreach(oldlc, oldDefaults)
 			{
@@ -533,7 +557,7 @@ ProcedureCreate(const char *procedureName,
 							 errhint("Use %s %s first.",
 									 dropcmd,
 									 format_procedure(oldproc->oid))));
-				newlc = lnext(parameterDefaults, newlc);
+				newlc = lnext(newlc);
 			}
 		}
 
@@ -901,8 +925,6 @@ fmgr_sql_validator(PG_FUNCTION_ARGS)
 			 * verify the result type.
 			 */
 			SQLFunctionParseInfoPtr pinfo;
-			Oid			rettype;
-			TupleDesc	rettupdesc;
 
 			/* But first, set up parameter information */
 			pinfo = prepare_sql_fn_parse_info(tuple, NULL, InvalidOid);
@@ -923,12 +945,9 @@ fmgr_sql_validator(PG_FUNCTION_ARGS)
 			}
 
 			check_sql_fn_statements(querytree_list);
-
-			(void) get_func_result_type(funcoid, &rettype, &rettupdesc);
-
-			(void) check_sql_fn_retval(querytree_list,
-									   rettype, rettupdesc,
-									   false, NULL);
+			(void) check_sql_fn_retval(funcoid, proc->prorettype,
+									   querytree_list,
+									   NULL, NULL);
 		}
 
 		error_context_stack = sqlerrcontext.previous;
@@ -1149,7 +1168,7 @@ oid_array_to_list(Datum datum)
 
 	deconstruct_array(array,
 					  OIDOID,
-					  sizeof(Oid), true, TYPALIGN_INT,
+					  sizeof(Oid), true, 'i',
 					  &values, NULL, &nelems);
 	for (i = 0; i < nelems; i++)
 		result = lappend_oid(result, values[i]);

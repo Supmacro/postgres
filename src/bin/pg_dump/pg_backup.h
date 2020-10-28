@@ -153,6 +153,7 @@ typedef struct _dumpOptions
 	int			no_synchronized_snapshots;
 	int			no_unlogged_table_data;
 	int			serializable_deferrable;
+	int			quote_all_identifiers;
 	int			disable_triggers;
 	int			outputNoTablespaces;
 	int			use_setsessauth;
@@ -232,6 +233,12 @@ typedef struct
 } CatalogId;
 
 typedef int DumpId;
+
+#define InvalidDumpId 0
+
+/*
+ * Function pointer prototypes for assorted callback methods.
+ */
 
 typedef int (*DataDumperPtr) (Archive *AH, void *userArg);
 

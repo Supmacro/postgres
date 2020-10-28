@@ -7,7 +7,7 @@
  * knowledge of the tuple descriptor. Fixed column widths, NOT NULLness, etc
  * can be taken advantage of.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -22,9 +22,25 @@
 
 #include "access/htup_details.h"
 #include "access/tupdesc_details.h"
+#include "catalog/pg_subscription.h"
+#include "catalog/pg_subscription_rel.h"
 #include "executor/tuptable.h"
 #include "jit/llvmjit.h"
 #include "jit/llvmjit_emit.h"
+
+
+/*
+ * Through an embarrassing oversight, pre-v13 installations may have
+ * pg_subscription.subslotname and pg_subscription_rel.srsublsn marked as
+ * attnotnull, which they should not be.  To avoid possible crashes, use
+ * this macro instead of testing attnotnull directly.
+ */
+#define ATTNOTNULL(att) \
+	((att)->attnotnull && \
+	 !(((att)->attrelid == SubscriptionRelationId && \
+		(att)->attnum == Anum_pg_subscription_subslotname) || \
+	   ((att)->attrelid == SubscriptionRelRelationId && \
+		(att)->attnum == Anum_pg_subscription_rel_srsublsn)))
 
 
 /*
@@ -121,7 +137,7 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 		 * combination of attisdropped && attnotnull combination shouldn't
 		 * exist.
 		 */
-		if (att->attnotnull &&
+		if (ATTNOTNULL(att) &&
 			!att->atthasmissing &&
 			!att->attisdropped)
 			guaranteed_column_number = attnum;
@@ -331,7 +347,7 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 		v_params[0] = v_slot;
 		v_params[1] = LLVMBuildZExt(b, v_maxatt, LLVMInt32Type(), "");
 		v_params[2] = l_int32_const(natts);
-		LLVMBuildCall(b, llvm_pg_func(mod, "slot_getmissingattrs"),
+		LLVMBuildCall(b, llvm_get_decl(mod, FuncSlotGetmissingattrs),
 					  v_params, lengthof(v_params), "");
 		LLVMBuildBr(b, b_find_start);
 	}
@@ -419,7 +435,7 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 		 * into account, because if they're present the heaptuple's natts
 		 * would have indicated that a slot_getmissingattrs() is needed.
 		 */
-		if (!att->attnotnull)
+		if (!ATTNOTNULL(att))
 		{
 			LLVMBasicBlockRef b_ifnotnull;
 			LLVMBasicBlockRef b_ifnull;
@@ -476,13 +492,13 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 		LLVMPositionBuilderAtEnd(b, attcheckalignblocks[attnum]);
 
 		/* determine required alignment */
-		if (att->attalign == TYPALIGN_INT)
+		if (att->attalign == 'i')
 			alignto = ALIGNOF_INT;
-		else if (att->attalign == TYPALIGN_CHAR)
+		else if (att->attalign == 'c')
 			alignto = 1;
-		else if (att->attalign == TYPALIGN_DOUBLE)
+		else if (att->attalign == 'd')
 			alignto = ALIGNOF_DOUBLE;
-		else if (att->attalign == TYPALIGN_SHORT)
+		else if (att->attalign == 's')
 			alignto = ALIGNOF_SHORT;
 		else
 		{
@@ -600,7 +616,7 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 			known_alignment = -1;
 			attguaranteedalign = false;
 		}
-		else if (att->attnotnull && attguaranteedalign && known_alignment >= 0)
+		else if (ATTNOTNULL(att) && attguaranteedalign && known_alignment >= 0)
 		{
 			/*
 			 * If the offset to the column was previously known, a NOT NULL &
@@ -610,7 +626,7 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 			Assert(att->attlen > 0);
 			known_alignment += att->attlen;
 		}
-		else if (att->attnotnull && (att->attlen % alignto) == 0)
+		else if (ATTNOTNULL(att) && (att->attlen % alignto) == 0)
 		{
 			/*
 			 * After a NOT NULL fixed-width column with a length that is a
@@ -682,7 +698,7 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 		else if (att->attlen == -1)
 		{
 			v_incby = LLVMBuildCall(b,
-									llvm_pg_func(mod, "varsize_any"),
+									llvm_get_decl(mod, FuncVarsizeAny),
 									&v_attdatap, 1,
 									"varsize_any");
 			l_callsite_ro(v_incby);
@@ -691,7 +707,7 @@ slot_compile_deform(LLVMJitContext *context, TupleDesc desc,
 		else if (att->attlen == -2)
 		{
 			v_incby = LLVMBuildCall(b,
-									llvm_pg_func(mod, "strlen"),
+									llvm_get_decl(mod, FuncStrlen),
 									&v_attdatap, 1, "strlen");
 
 			l_callsite_ro(v_incby);

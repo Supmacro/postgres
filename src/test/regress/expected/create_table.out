@@ -331,19 +331,6 @@ CREATE TABLE default_expr_agg (a int DEFAULT (generate_series(1,3)));
 ERROR:  set-returning functions are not allowed in DEFAULT expressions
 LINE 1: CREATE TABLE default_expr_agg (a int DEFAULT (generate_serie...
                                                       ^
--- Verify that subtransaction rollback restores rd_createSubid.
-BEGIN;
-CREATE TABLE remember_create_subid (c int);
-SAVEPOINT q; DROP TABLE remember_create_subid; ROLLBACK TO q;
-COMMIT;
-DROP TABLE remember_create_subid;
--- Verify that subtransaction rollback restores rd_firstRelfilenodeSubid.
-CREATE TABLE remember_node_subid (c int);
-BEGIN;
-ALTER TABLE remember_node_subid ALTER c TYPE bigint;
-SAVEPOINT q; DROP TABLE remember_node_subid; ROLLBACK TO q;
-COMMIT;
-DROP TABLE remember_node_subid;
 --
 -- Partitioned tables
 --
@@ -433,6 +420,11 @@ CREATE TABLE partitioned (
 ) PARTITION BY RANGE (immut_func(a));
 ERROR:  functions in partition key expression must be marked IMMUTABLE
 DROP FUNCTION immut_func(int);
+-- cannot contain whole-row references
+CREATE TABLE partitioned (
+	a	int
+) PARTITION BY RANGE ((partitioned));
+ERROR:  partition key expressions cannot contain whole-row references
 -- prevent using columns of unsupported types in key (type must have a btree operator class)
 CREATE TABLE partitioned (
 	a point
@@ -520,47 +512,6 @@ Partition of: partitioned2 FOR VALUES FROM ('-1', 'aaaaa') TO (100, 'ccccc')
 Partition constraint: (((a + 1) IS NOT NULL) AND (substr(b, 1, 5) IS NOT NULL) AND (((a + 1) > '-1'::integer) OR (((a + 1) = '-1'::integer) AND (substr(b, 1, 5) >= 'aaaaa'::text))) AND (((a + 1) < 100) OR (((a + 1) = 100) AND (substr(b, 1, 5) < 'ccccc'::text))))
 
 DROP TABLE partitioned, partitioned2;
--- check reference to partitioned table's rowtype in partition descriptor
-create table partitioned (a int, b int)
-  partition by list ((row(a, b)::partitioned));
-create table partitioned1
-  partition of partitioned for values in ('(1,2)'::partitioned);
-create table partitioned2
-  partition of partitioned for values in ('(2,4)'::partitioned);
-explain (costs off)
-select * from partitioned where row(a,b)::partitioned = '(1,2)'::partitioned;
-                        QUERY PLAN                         
------------------------------------------------------------
- Seq Scan on partitioned1 partitioned
-   Filter: (ROW(a, b)::partitioned = '(1,2)'::partitioned)
-(2 rows)
-
-drop table partitioned;
--- whole-row Var in partition key works too
-create table partitioned (a int, b int)
-  partition by list ((partitioned));
-create table partitioned1
-  partition of partitioned for values in ('(1,2)');
-create table partitioned2
-  partition of partitioned for values in ('(2,4)');
-explain (costs off)
-select * from partitioned where partitioned = '(1,2)'::partitioned;
-                           QUERY PLAN                            
------------------------------------------------------------------
- Seq Scan on partitioned1 partitioned
-   Filter: ((partitioned.*)::partitioned = '(1,2)'::partitioned)
-(2 rows)
-
-\d+ partitioned1
-                               Table "public.partitioned1"
- Column |  Type   | Collation | Nullable | Default | Storage | Stats target | Description 
---------+---------+-----------+----------+---------+---------+--------------+-------------
- a      | integer |           |          |         | plain   |              | 
- b      | integer |           |          |         | plain   |              | 
-Partition of: partitioned FOR VALUES IN ('(1,2)')
-Partition constraint: (((partitioned1.*)::partitioned IS DISTINCT FROM NULL) AND ((partitioned1.*)::partitioned = '(1,2)'::partitioned))
-
-drop table partitioned;
 -- check that dependencies of partition columns are handled correctly
 create domain intdom1 as int;
 create table partitioned (
@@ -974,7 +925,7 @@ CREATE TABLE part_c_1_10 PARTITION OF part_c FOR VALUES FROM (1) TO (10);
 create table parted_notnull_inh_test (a int default 1, b int not null default 0) partition by list (a);
 create table parted_notnull_inh_test1 partition of parted_notnull_inh_test (a not null, b default 1) for values in (1);
 insert into parted_notnull_inh_test (b) values (null);
-ERROR:  null value in column "b" of relation "parted_notnull_inh_test1" violates not-null constraint
+ERROR:  null value in column "b" violates not-null constraint
 DETAIL:  Failing row contains (1, null).
 -- note that while b's default is overriden, a's default is preserved
 \d parted_notnull_inh_test1

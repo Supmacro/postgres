@@ -26,7 +26,7 @@
  *	before ExecutorEnd.  This can be omitted only in case of EXPLAIN,
  *	which should also omit ExecutorRun.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -787,11 +787,11 @@ ExecCheckXactReadOnly(PlannedStmt *plannedstmt)
 		if (isTempNamespace(get_rel_namespace(rte->relid)))
 			continue;
 
-		PreventCommandIfReadOnly(CreateCommandName((Node *) plannedstmt));
+		PreventCommandIfReadOnly(CreateCommandTag((Node *) plannedstmt));
 	}
 
 	if (plannedstmt->commandType != CMD_SELECT || plannedstmt->hasModifyingCTE)
-		PreventCommandIfParallelMode(CreateCommandName((Node *) plannedstmt));
+		PreventCommandIfParallelMode(CreateCommandTag((Node *) plannedstmt));
 }
 
 
@@ -1843,14 +1843,15 @@ ExecPartitionCheckEmitError(ResultRelInfo *resultRelInfo,
 	if (resultRelInfo->ri_PartitionRoot)
 	{
 		TupleDesc	old_tupdesc;
-		AttrMap    *map;
+		AttrNumber *map;
 
 		root_relid = RelationGetRelid(resultRelInfo->ri_PartitionRoot);
 		tupdesc = RelationGetDescr(resultRelInfo->ri_PartitionRoot);
 
 		old_tupdesc = RelationGetDescr(resultRelInfo->ri_RelationDesc);
 		/* a reverse map */
-		map = build_attrmap_by_name_if_req(old_tupdesc, tupdesc);
+		map = convert_tuples_by_name_map_if_req(old_tupdesc, tupdesc,
+												gettext_noop("could not convert row type"));
 
 		/*
 		 * Partition-specific slot's tupdesc can't be changed, so allocate a
@@ -1878,8 +1879,7 @@ ExecPartitionCheckEmitError(ResultRelInfo *resultRelInfo,
 			(errcode(ERRCODE_CHECK_VIOLATION),
 			 errmsg("new row for relation \"%s\" violates partition constraint",
 					RelationGetRelationName(resultRelInfo->ri_RelationDesc)),
-			 val_desc ? errdetail("Failing row contains %s.", val_desc) : 0,
-			 errtable(resultRelInfo->ri_RelationDesc)));
+			 val_desc ? errdetail("Failing row contains %s.", val_desc) : 0));
 }
 
 /*
@@ -1930,13 +1930,14 @@ ExecConstraints(ResultRelInfo *resultRelInfo,
 				 */
 				if (resultRelInfo->ri_PartitionRoot)
 				{
-					AttrMap    *map;
+					AttrNumber *map;
 
 					rel = resultRelInfo->ri_PartitionRoot;
 					tupdesc = RelationGetDescr(rel);
 					/* a reverse map */
-					map = build_attrmap_by_name_if_req(orig_tupdesc,
-													   tupdesc);
+					map = convert_tuples_by_name_map_if_req(orig_tupdesc,
+															tupdesc,
+															gettext_noop("could not convert row type"));
 
 					/*
 					 * Partition-specific slot's tupdesc can't be changed, so
@@ -1958,9 +1959,8 @@ ExecConstraints(ResultRelInfo *resultRelInfo,
 
 				ereport(ERROR,
 						(errcode(ERRCODE_NOT_NULL_VIOLATION),
-						 errmsg("null value in column \"%s\" of relation \"%s\" violates not-null constraint",
-								NameStr(att->attname),
-								RelationGetRelationName(orig_rel)),
+						 errmsg("null value in column \"%s\" violates not-null constraint",
+								NameStr(att->attname)),
 						 val_desc ? errdetail("Failing row contains %s.", val_desc) : 0,
 						 errtablecol(orig_rel, attrChk)));
 			}
@@ -1980,13 +1980,14 @@ ExecConstraints(ResultRelInfo *resultRelInfo,
 			if (resultRelInfo->ri_PartitionRoot)
 			{
 				TupleDesc	old_tupdesc = RelationGetDescr(rel);
-				AttrMap    *map;
+				AttrNumber *map;
 
 				rel = resultRelInfo->ri_PartitionRoot;
 				tupdesc = RelationGetDescr(rel);
 				/* a reverse map */
-				map = build_attrmap_by_name_if_req(old_tupdesc,
-												   tupdesc);
+				map = convert_tuples_by_name_map_if_req(old_tupdesc,
+														tupdesc,
+														gettext_noop("could not convert row type"));
 
 				/*
 				 * Partition-specific slot's tupdesc can't be changed, so
@@ -2087,13 +2088,14 @@ ExecWithCheckOptions(WCOKind kind, ResultRelInfo *resultRelInfo,
 					if (resultRelInfo->ri_PartitionRoot)
 					{
 						TupleDesc	old_tupdesc = RelationGetDescr(rel);
-						AttrMap    *map;
+						AttrNumber *map;
 
 						rel = resultRelInfo->ri_PartitionRoot;
 						tupdesc = RelationGetDescr(rel);
 						/* a reverse map */
-						map = build_attrmap_by_name_if_req(old_tupdesc,
-														   tupdesc);
+						map = convert_tuples_by_name_map_if_req(old_tupdesc,
+																tupdesc,
+																gettext_noop("could not convert row type"));
 
 						/*
 						 * Partition-specific slot's tupdesc can't be changed,
@@ -2277,7 +2279,7 @@ ExecBuildSlotValueDescription(Oid reloid,
 			/* truncate if needed */
 			vallen = strlen(val);
 			if (vallen <= maxfieldlen)
-				appendBinaryStringInfo(&buf, val, vallen);
+				appendStringInfoString(&buf, val);
 			else
 			{
 				vallen = pg_mbcliplen(val, vallen, maxfieldlen);
@@ -2296,7 +2298,7 @@ ExecBuildSlotValueDescription(Oid reloid,
 	if (!table_perm)
 	{
 		appendStringInfoString(&collist, ") = ");
-		appendBinaryStringInfo(&collist, buf.data, buf.len);
+		appendStringInfoString(&collist, buf.data);
 
 		return collist.data;
 	}
@@ -2785,6 +2787,7 @@ EvalPlanQualStart(EPQState *epqstate, Plan *planTree)
 	rcestate->es_snapshot = parentestate->es_snapshot;
 	rcestate->es_crosscheck_snapshot = parentestate->es_crosscheck_snapshot;
 	rcestate->es_range_table = parentestate->es_range_table;
+	rcestate->es_range_table_array = parentestate->es_range_table_array;
 	rcestate->es_range_table_size = parentestate->es_range_table_size;
 	rcestate->es_relations = parentestate->es_relations;
 	rcestate->es_queryEnv = parentestate->es_queryEnv;

@@ -3,7 +3,7 @@
  * plpgsql.h		- Definitions for the PL/pgSQL
  *			  procedural language
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -231,19 +231,9 @@ typedef struct PLpgSQL_expr
 
 	/* fields for "simple expression" fast-path execution: */
 	Expr	   *expr_simple_expr;	/* NULL means not a simple expr */
+	int			expr_simple_generation; /* plancache generation we checked */
 	Oid			expr_simple_type;	/* result type Oid, if simple */
 	int32		expr_simple_typmod; /* result typmod, if simple */
-	bool		expr_simple_mutable;	/* true if simple expr is mutable */
-
-	/*
-	 * If the expression was ever determined to be simple, we remember its
-	 * CachedPlanSource and CachedPlan here.  If expr_simple_plan_lxid matches
-	 * current LXID, then we hold a refcount on expr_simple_plan in the
-	 * current transaction.  Otherwise we need to get one before re-using it.
-	 */
-	CachedPlanSource *expr_simple_plansource;	/* extracted from "plan" */
-	CachedPlan *expr_simple_plan;	/* extracted from "plan" */
-	LocalTransactionId expr_simple_plan_lxid;
 
 	/*
 	 * if expr is simple AND prepared in current transaction,
@@ -706,7 +696,7 @@ typedef struct PLpgSQL_stmt_fori
 /*
  * PLpgSQL_stmt_forq represents a FOR statement running over a SQL query.
  * It is the common supertype of PLpgSQL_stmt_fors, PLpgSQL_stmt_forc
- * and PLpgSQL_stmt_dynfors.
+ * and PLpgSQL_dynfors.
  */
 typedef struct PLpgSQL_stmt_forq
 {
@@ -1091,9 +1081,8 @@ typedef struct PLpgSQL_execstate
 	 */
 	ParamListInfo paramLI;
 
-	/* EState and resowner to use for "simple" expression evaluation */
+	/* EState to use for "simple" expression evaluation */
 	EState	   *simple_eval_estate;
-	ResourceOwner simple_eval_resowner;
 
 	/* lookup table to use for executing type casts */
 	HTAB	   *cast_hash;
@@ -1278,7 +1267,6 @@ extern void _PG_init(void);
 extern Datum plpgsql_exec_function(PLpgSQL_function *func,
 								   FunctionCallInfo fcinfo,
 								   EState *simple_eval_estate,
-								   ResourceOwner simple_eval_resowner,
 								   bool atomic);
 extern HeapTuple plpgsql_exec_trigger(PLpgSQL_function *func,
 									  TriggerData *trigdata);

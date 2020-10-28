@@ -3,7 +3,7 @@
  * rewriteHandler.c
  *		Primary module of query rewriter.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -808,9 +808,7 @@ rewriteTargetListIU(List *targetList,
 		{
 			if (att_tup->attidentity == ATTRIBUTE_IDENTITY_ALWAYS && !apply_default)
 			{
-				if (override == OVERRIDING_USER_VALUE)
-					apply_default = true;
-				else if (override != OVERRIDING_SYSTEM_VALUE)
+				if (override != OVERRIDING_SYSTEM_VALUE)
 					ereport(ERROR,
 							(errcode(ERRCODE_GENERATED_ALWAYS),
 							 errmsg("cannot insert into column \"%s\"", NameStr(att_tup->attname)),
@@ -1044,11 +1042,11 @@ process_matched_tle(TargetEntry *src_tle,
 			/* combine the two */
 			memcpy(fstore, prior_expr, sizeof(FieldStore));
 			fstore->newvals =
-				list_concat_copy(((FieldStore *) prior_expr)->newvals,
-								 ((FieldStore *) src_expr)->newvals);
+				list_concat(list_copy(((FieldStore *) prior_expr)->newvals),
+							list_copy(((FieldStore *) src_expr)->newvals));
 			fstore->fieldnums =
-				list_concat_copy(((FieldStore *) prior_expr)->fieldnums,
-								 ((FieldStore *) src_expr)->fieldnums);
+				list_concat(list_copy(((FieldStore *) prior_expr)->fieldnums),
+							list_copy(((FieldStore *) src_expr)->fieldnums));
 		}
 		else
 		{
@@ -1133,7 +1131,7 @@ build_column_default(Relation rel, int attrno)
 	{
 		NextValueExpr *nve = makeNode(NextValueExpr);
 
-		nve->seqid = getIdentitySequence(RelationGetRelid(rel), attrno, false);
+		nve->seqid = getOwnedSequence(RelationGetRelid(rel), attrno);
 		nve->typeId = att_tup->atttypid;
 
 		return (Node *) nve;
@@ -1976,7 +1974,7 @@ fireRIRrules(Query *parsetree, List *activeRIRs)
 							(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 							 errmsg("infinite recursion detected in rules for relation \"%s\"",
 									RelationGetRelationName(rel))));
-				activeRIRs = lappend_oid(activeRIRs, RelationGetRelid(rel));
+				activeRIRs = lcons_oid(RelationGetRelid(rel), activeRIRs);
 
 				foreach(l, locks)
 				{
@@ -1989,7 +1987,7 @@ fireRIRrules(Query *parsetree, List *activeRIRs)
 												  activeRIRs);
 				}
 
-				activeRIRs = list_delete_last(activeRIRs);
+				activeRIRs = list_delete_first(activeRIRs);
 			}
 		}
 
@@ -2062,7 +2060,7 @@ fireRIRrules(Query *parsetree, List *activeRIRs)
 							 errmsg("infinite recursion detected in policy for relation \"%s\"",
 									RelationGetRelationName(rel))));
 
-				activeRIRs = lappend_oid(activeRIRs, RelationGetRelid(rel));
+				activeRIRs = lcons_oid(RelationGetRelid(rel), activeRIRs);
 
 				/*
 				 * get_row_security_policies just passed back securityQuals
@@ -2087,7 +2085,7 @@ fireRIRrules(Query *parsetree, List *activeRIRs)
 				expression_tree_walker((Node *) withCheckOptions,
 									   fireRIRonSubLink, (void *) activeRIRs);
 
-				activeRIRs = list_delete_last(activeRIRs);
+				activeRIRs = list_delete_first(activeRIRs);
 			}
 
 			/*
@@ -2796,15 +2794,15 @@ relation_is_updatable(Oid reloid,
 				base_rte->relkind != RELKIND_PARTITIONED_TABLE)
 			{
 				baseoid = base_rte->relid;
-				outer_reloids = lappend_oid(outer_reloids,
-											RelationGetRelid(rel));
+				outer_reloids = lcons_oid(RelationGetRelid(rel),
+										  outer_reloids);
 				include_cols = adjust_view_column_set(updatable_cols,
 													  viewquery->targetList);
 				auto_events &= relation_is_updatable(baseoid,
 													 outer_reloids,
 													 include_triggers,
 													 include_cols);
-				outer_reloids = list_delete_last(outer_reloids);
+				outer_reloids = list_delete_first(outer_reloids);
 			}
 			events |= auto_events;
 		}
@@ -3229,7 +3227,6 @@ rewriteTargetView(Query *parsetree, Relation view)
 	{
 		Index		old_exclRelIndex,
 					new_exclRelIndex;
-		ParseNamespaceItem *new_exclNSItem;
 		RangeTblEntry *new_exclRte;
 		List	   *tmp_tlist;
 
@@ -3264,12 +3261,11 @@ rewriteTargetView(Query *parsetree, Relation view)
 		 */
 		old_exclRelIndex = parsetree->onConflict->exclRelIndex;
 
-		new_exclNSItem = addRangeTableEntryForRelation(make_parsestate(NULL),
-													   base_rel,
-													   RowExclusiveLock,
-													   makeAlias("excluded", NIL),
-													   false, false);
-		new_exclRte = new_exclNSItem->p_rte;
+		new_exclRte = addRangeTableEntryForRelation(make_parsestate(NULL),
+													base_rel,
+													RowExclusiveLock,
+													makeAlias("excluded", NIL),
+													false, false);
 		new_exclRte->relkind = RELKIND_COMPOSITE_TYPE;
 		new_exclRte->requiredPerms = 0;
 		/* other permissions fields in new_exclRte are already empty */
@@ -3786,7 +3782,7 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 			rev = (rewrite_event *) palloc(sizeof(rewrite_event));
 			rev->relation = RelationGetRelid(rt_entry_relation);
 			rev->event = event;
-			rewrite_events = lappend(rewrite_events, rev);
+			rewrite_events = lcons(rev, rewrite_events);
 
 			foreach(n, product_queries)
 			{
@@ -3797,7 +3793,7 @@ RewriteQuery(Query *parsetree, List *rewrite_events)
 				rewritten = list_concat(rewritten, newstuff);
 			}
 
-			rewrite_events = list_delete_last(rewrite_events);
+			rewrite_events = list_delete_first(rewrite_events);
 		}
 
 		/*

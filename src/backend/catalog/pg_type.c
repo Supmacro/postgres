@@ -3,7 +3,7 @@
  * pg_type.c
  *	  routines to support manipulation of the pg_type relation
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,8 +17,8 @@
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/xact.h"
-#include "catalog/binary_upgrade.h"
 #include "catalog/catalog.h"
+#include "catalog/binary_upgrade.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
@@ -111,8 +111,8 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
 	values[Anum_pg_type_typmodin - 1] = ObjectIdGetDatum(InvalidOid);
 	values[Anum_pg_type_typmodout - 1] = ObjectIdGetDatum(InvalidOid);
 	values[Anum_pg_type_typanalyze - 1] = ObjectIdGetDatum(InvalidOid);
-	values[Anum_pg_type_typalign - 1] = CharGetDatum(TYPALIGN_INT);
-	values[Anum_pg_type_typstorage - 1] = CharGetDatum(TYPSTORAGE_PLAIN);
+	values[Anum_pg_type_typalign - 1] = CharGetDatum('i');
+	values[Anum_pg_type_typstorage - 1] = CharGetDatum('p');
 	values[Anum_pg_type_typnotnull - 1] = BoolGetDatum(false);
 	values[Anum_pg_type_typbasetype - 1] = ObjectIdGetDatum(InvalidOid);
 	values[Anum_pg_type_typtypmod - 1] = Int32GetDatum(-1);
@@ -155,8 +155,8 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
 	 * Create dependencies.  We can/must skip this in bootstrap mode.
 	 */
 	if (!IsBootstrapProcessingMode())
-		GenerateTypeDependencies(tup,
-								 pg_type_desc,
+		GenerateTypeDependencies(typoid,
+								 (Form_pg_type) GETSTRUCT(tup),
 								 NULL,
 								 NULL,
 								 0,
@@ -259,7 +259,7 @@ TypeCreate(Oid newTypeOid,
 		 */
 		if (internalSize == (int16) sizeof(char))
 		{
-			if (alignment != TYPALIGN_CHAR)
+			if (alignment != 'c')
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 						 errmsg("alignment \"%c\" is invalid for passed-by-value type of size %d",
@@ -267,7 +267,7 @@ TypeCreate(Oid newTypeOid,
 		}
 		else if (internalSize == (int16) sizeof(int16))
 		{
-			if (alignment != TYPALIGN_SHORT)
+			if (alignment != 's')
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 						 errmsg("alignment \"%c\" is invalid for passed-by-value type of size %d",
@@ -275,7 +275,7 @@ TypeCreate(Oid newTypeOid,
 		}
 		else if (internalSize == (int16) sizeof(int32))
 		{
-			if (alignment != TYPALIGN_INT)
+			if (alignment != 'i')
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 						 errmsg("alignment \"%c\" is invalid for passed-by-value type of size %d",
@@ -284,7 +284,7 @@ TypeCreate(Oid newTypeOid,
 #if SIZEOF_DATUM == 8
 		else if (internalSize == (int16) sizeof(Datum))
 		{
-			if (alignment != TYPALIGN_DOUBLE)
+			if (alignment != 'd')
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 						 errmsg("alignment \"%c\" is invalid for passed-by-value type of size %d",
@@ -300,14 +300,13 @@ TypeCreate(Oid newTypeOid,
 	else
 	{
 		/* varlena types must have int align or better */
-		if (internalSize == -1 &&
-			!(alignment == TYPALIGN_INT || alignment == TYPALIGN_DOUBLE))
+		if (internalSize == -1 && !(alignment == 'i' || alignment == 'd'))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("alignment \"%c\" is invalid for variable-length type",
 							alignment)));
 		/* cstring must have char alignment */
-		if (internalSize == -2 && !(alignment == TYPALIGN_CHAR))
+		if (internalSize == -2 && !(alignment == 'c'))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 					 errmsg("alignment \"%c\" is invalid for variable-length type",
@@ -315,7 +314,7 @@ TypeCreate(Oid newTypeOid,
 	}
 
 	/* Only varlena types can be toasted */
-	if (storage != TYPSTORAGE_PLAIN && internalSize != -1)
+	if (storage != 'p' && internalSize != -1)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
 				 errmsg("fixed-size types must have storage PLAIN")));
@@ -488,8 +487,8 @@ TypeCreate(Oid newTypeOid,
 	 * Create dependencies.  We can/must skip this in bootstrap mode.
 	 */
 	if (!IsBootstrapProcessingMode())
-		GenerateTypeDependencies(tup,
-								 pg_type_desc,
+		GenerateTypeDependencies(typeObjectId,
+								 (Form_pg_type) GETSTRUCT(tup),
 								 (defaultTypeBin ?
 								  stringToNode(defaultTypeBin) :
 								  NULL),
@@ -516,16 +515,12 @@ TypeCreate(Oid newTypeOid,
  * GenerateTypeDependencies: build the dependencies needed for a type
  *
  * Most of what this function needs to know about the type is passed as the
- * new pg_type row, typeTuple.  We make callers pass the pg_type Relation
- * as well, so that we have easy access to a tuple descriptor for the row.
- *
- * While this is able to extract the defaultExpr and typacl from the tuple,
- * doing so is relatively expensive, and callers may have those values at
- * hand already.  Pass those if handy, otherwise pass NULL.  (typacl is really
+ * new pg_type row, typeForm.  But we can't get at the varlena fields through
+ * that, so defaultExpr and typacl are passed separately.  (typacl is really
  * "Acl *", but we declare it "void *" to avoid including acl.h in pg_type.h.)
  *
- * relationKind and isImplicitArray are likewise somewhat expensive to deduce
- * from the tuple, so we make callers pass those (they're not optional).
+ * relationKind and isImplicitArray aren't visible in the pg_type row either,
+ * so they're also passed separately.
  *
  * isDependentType is true if this is an implicit array or relation rowtype;
  * that means it doesn't need its own dependencies on owner etc.
@@ -539,8 +534,8 @@ TypeCreate(Oid newTypeOid,
  * that type will become a member of the extension.)
  */
 void
-GenerateTypeDependencies(HeapTuple typeTuple,
-						 Relation typeCatalog,
+GenerateTypeDependencies(Oid typeObjectId,
+						 Form_pg_type typeForm,
 						 Node *defaultExpr,
 						 void *typacl,
 						 char relationKind, /* only for relation rowtypes */
@@ -548,29 +543,8 @@ GenerateTypeDependencies(HeapTuple typeTuple,
 						 bool isDependentType,
 						 bool rebuild)
 {
-	Form_pg_type typeForm = (Form_pg_type) GETSTRUCT(typeTuple);
-	Oid			typeObjectId = typeForm->oid;
-	Datum		datum;
-	bool		isNull;
 	ObjectAddress myself,
 				referenced;
-
-	/* Extract defaultExpr if caller didn't pass it */
-	if (defaultExpr == NULL)
-	{
-		datum = heap_getattr(typeTuple, Anum_pg_type_typdefaultbin,
-							 RelationGetDescr(typeCatalog), &isNull);
-		if (!isNull)
-			defaultExpr = stringToNode(TextDatumGetCString(datum));
-	}
-	/* Extract typacl if caller didn't pass it */
-	if (typacl == NULL)
-	{
-		datum = heap_getattr(typeTuple, Anum_pg_type_typacl,
-							 RelationGetDescr(typeCatalog), &isNull);
-		if (!isNull)
-			typacl = DatumGetAclPCopy(datum);
-	}
 
 	/* If rebuild, first flush old dependencies, except extension deps */
 	if (rebuild)
@@ -811,12 +785,15 @@ makeArrayTypeName(const char *typeName, Oid typeNamespace)
 {
 	char	   *arr = (char *) palloc(NAMEDATALEN);
 	int			namelen = strlen(typeName);
+	Relation	pg_type_desc;
 	int			i;
 
 	/*
 	 * The idea is to prepend underscores as needed until we make a name that
 	 * doesn't collide with anything...
 	 */
+	pg_type_desc = table_open(TypeRelationId, AccessShareLock);
+
 	for (i = 1; i < NAMEDATALEN - 1; i++)
 	{
 		arr[i - 1] = '_';
@@ -832,6 +809,8 @@ makeArrayTypeName(const char *typeName, Oid typeNamespace)
 								   ObjectIdGetDatum(typeNamespace)))
 			break;
 	}
+
+	table_close(pg_type_desc, AccessShareLock);
 
 	if (i >= NAMEDATALEN - 1)
 		ereport(ERROR,

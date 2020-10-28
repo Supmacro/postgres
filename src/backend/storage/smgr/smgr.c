@@ -6,7 +6,7 @@
  *	  All file system operations in POSTGRES dispatch through these
  *	  routines.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,6 +17,7 @@
  */
 #include "postgres.h"
 
+#include "commands/tablespace.h"
 #include "lib/ilist.h"
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
@@ -40,7 +41,6 @@ typedef struct f_smgr
 {
 	void		(*smgr_init) (void);	/* may be NULL */
 	void		(*smgr_shutdown) (void);	/* may be NULL */
-	void		(*smgr_open) (SMgrRelation reln);
 	void		(*smgr_close) (SMgrRelation reln, ForkNumber forknum);
 	void		(*smgr_create) (SMgrRelation reln, ForkNumber forknum,
 								bool isRedo);
@@ -49,7 +49,7 @@ typedef struct f_smgr
 								bool isRedo);
 	void		(*smgr_extend) (SMgrRelation reln, ForkNumber forknum,
 								BlockNumber blocknum, char *buffer, bool skipFsync);
-	bool		(*smgr_prefetch) (SMgrRelation reln, ForkNumber forknum,
+	void		(*smgr_prefetch) (SMgrRelation reln, ForkNumber forknum,
 								  BlockNumber blocknum);
 	void		(*smgr_read) (SMgrRelation reln, ForkNumber forknum,
 							  BlockNumber blocknum, char *buffer);
@@ -68,7 +68,6 @@ static const f_smgr smgrsw[] = {
 	{
 		.smgr_init = mdinit,
 		.smgr_shutdown = NULL,
-		.smgr_open = mdopen,
 		.smgr_close = mdclose,
 		.smgr_create = mdcreate,
 		.smgr_exists = mdexists,
@@ -171,6 +170,8 @@ smgropen(RelFileNode rnode, BackendId backend)
 	/* Initialize it if not present before */
 	if (!found)
 	{
+		int			forknum;
+
 		/* hash_search already filled in the lookup key */
 		reln->smgr_owner = NULL;
 		reln->smgr_targblock = InvalidBlockNumber;
@@ -178,8 +179,9 @@ smgropen(RelFileNode rnode, BackendId backend)
 		reln->smgr_vm_nblocks = InvalidBlockNumber;
 		reln->smgr_which = 0;	/* we only have md.c at present */
 
-		/* implementation-specific initialization */
-		smgrsw[reln->smgr_which].smgr_open(reln);
+		/* mark it not open */
+		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+			reln->md_num_open_segs[forknum] = 0;
 
 		/* it has no owner yet */
 		dlist_push_tail(&unowned_relns, &reln->node);
@@ -328,46 +330,90 @@ smgrclosenode(RelFileNodeBackend rnode)
  *		Given an already-created (but presumably unused) SMgrRelation,
  *		cause the underlying disk file or other storage for the fork
  *		to be created.
+ *
+ *		If isRedo is true, it is okay for the underlying file to exist
+ *		already because we are in a WAL replay sequence.
  */
 void
 smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 {
+	/*
+	 * Exit quickly in WAL replay mode if we've already opened the file. If
+	 * it's open, it surely must exist.
+	 */
+	if (isRedo && reln->md_num_open_segs[forknum] > 0)
+		return;
+
+	/*
+	 * We may be using the target table space for the first time in this
+	 * database, so create a per-database subdirectory if needed.
+	 *
+	 * XXX this is a fairly ugly violation of module layering, but this seems
+	 * to be the best place to put the check.  Maybe TablespaceCreateDbspace
+	 * should be here and not in commands/tablespace.c?  But that would imply
+	 * importing a lot of stuff that smgr.c oughtn't know, either.
+	 */
+	TablespaceCreateDbspace(reln->smgr_rnode.node.spcNode,
+							reln->smgr_rnode.node.dbNode,
+							isRedo);
+
 	smgrsw[reln->smgr_which].smgr_create(reln, forknum, isRedo);
 }
 
 /*
- *	smgrdosyncall() -- Immediately sync all forks of all given relations
+ *	smgrdounlink() -- Immediately unlink all forks of a relation.
  *
- *		All forks of all given relations are synced out to the store.
+ *		All forks of the relation are removed from the store.  This should
+ *		not be used during transactional operations, since it can't be undone.
  *
- *		This is equivalent to FlushRelationBuffers() for each smgr relation,
- *		then calling smgrimmedsync() for all forks of each relation, but it's
- *		significantly quicker so should be preferred when possible.
+ *		If isRedo is true, it is okay for the underlying file(s) to be gone
+ *		already.
+ *
+ *		This is equivalent to calling smgrdounlinkfork for each fork, but
+ *		it's significantly quicker so should be preferred when possible.
  */
 void
-smgrdosyncall(SMgrRelation *rels, int nrels)
+smgrdounlink(SMgrRelation reln, bool isRedo)
 {
-	int			i = 0;
+	RelFileNodeBackend rnode = reln->smgr_rnode;
+	int			which = reln->smgr_which;
 	ForkNumber	forknum;
 
-	if (nrels == 0)
-		return;
-
-	FlushRelationsAllBuffers(rels, nrels);
+	/* Close the forks at smgr level */
+	for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+		smgrsw[which].smgr_close(reln, forknum);
 
 	/*
-	 * Sync the physical file(s).
+	 * Get rid of any remaining buffers for the relation.  bufmgr will just
+	 * drop them without bothering to write the contents.
 	 */
-	for (i = 0; i < nrels; i++)
-	{
-		int			which = rels[i]->smgr_which;
+	DropRelFileNodesAllBuffers(&rnode, 1);
 
-		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
-		{
-			if (smgrsw[which].smgr_exists(rels[i], forknum))
-				smgrsw[which].smgr_immedsync(rels[i], forknum);
-		}
-	}
+	/*
+	 * It'd be nice to tell the stats collector to forget it immediately, too.
+	 * But we can't because we don't know the OID (and in cases involving
+	 * relfilenode swaps, it's not always clear which table OID to forget,
+	 * anyway).
+	 */
+
+	/*
+	 * Send a shared-inval message to force other backends to close any
+	 * dangling smgr references they may have for this rel.  We should do this
+	 * before starting the actual unlinking, in case we fail partway through
+	 * that step.  Note that the sinval message will eventually come back to
+	 * this backend, too, and thereby provide a backstop that we closed our
+	 * own smgr rel.
+	 */
+	CacheInvalidateSmgr(rnode);
+
+	/*
+	 * Delete the physical file(s).
+	 *
+	 * Note: smgr_unlink must treat deletion failure as a WARNING, not an
+	 * ERROR, because we've already decided to commit or abort the current
+	 * xact.
+	 */
+	smgrsw[which].smgr_unlink(rnode, InvalidForkNumber, isRedo);
 }
 
 /*
@@ -379,6 +425,9 @@ smgrdosyncall(SMgrRelation *rels, int nrels)
  *
  *		If isRedo is true, it is okay for the underlying file(s) to be gone
  *		already.
+ *
+ *		This is equivalent to calling smgrdounlink for each relation, but it's
+ *		significantly quicker so should be preferred when possible.
  */
 void
 smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
@@ -448,6 +497,57 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 	pfree(rnodes);
 }
 
+/*
+ *	smgrdounlinkfork() -- Immediately unlink one fork of a relation.
+ *
+ *		The specified fork of the relation is removed from the store.  This
+ *		should not be used during transactional operations, since it can't be
+ *		undone.
+ *
+ *		If isRedo is true, it is okay for the underlying file to be gone
+ *		already.
+ */
+void
+smgrdounlinkfork(SMgrRelation reln, ForkNumber forknum, bool isRedo)
+{
+	RelFileNodeBackend rnode = reln->smgr_rnode;
+	int			which = reln->smgr_which;
+
+	/* Close the fork at smgr level */
+	smgrsw[which].smgr_close(reln, forknum);
+
+	/*
+	 * Get rid of any remaining buffers for the fork.  bufmgr will just drop
+	 * them without bothering to write the contents.
+	 */
+	DropRelFileNodeBuffers(rnode, forknum, 0);
+
+	/*
+	 * It'd be nice to tell the stats collector to forget it immediately, too.
+	 * But we can't because we don't know the OID (and in cases involving
+	 * relfilenode swaps, it's not always clear which table OID to forget,
+	 * anyway).
+	 */
+
+	/*
+	 * Send a shared-inval message to force other backends to close any
+	 * dangling smgr references they may have for this rel.  We should do this
+	 * before starting the actual unlinking, in case we fail partway through
+	 * that step.  Note that the sinval message will eventually come back to
+	 * this backend, too, and thereby provide a backstop that we closed our
+	 * own smgr rel.
+	 */
+	CacheInvalidateSmgr(rnode);
+
+	/*
+	 * Delete the physical file(s).
+	 *
+	 * Note: smgr_unlink must treat deletion failure as a WARNING, not an
+	 * ERROR, because we've already decided to commit or abort the current
+	 * xact.
+	 */
+	smgrsw[which].smgr_unlink(rnode, forknum, isRedo);
+}
 
 /*
  *	smgrextend() -- Add a new block to a file.
@@ -468,15 +568,11 @@ smgrextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 /*
  *	smgrprefetch() -- Initiate asynchronous read of the specified block of a relation.
- *
- *		In recovery only, this can return false to indicate that a file
- *		doesn't	exist (presumably it has been dropped by a later WAL
- *		record).
  */
-bool
+void
 smgrprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
 {
-	return smgrsw[reln->smgr_which].smgr_prefetch(reln, forknum, blocknum);
+	smgrsw[reln->smgr_which].smgr_prefetch(reln, forknum, blocknum);
 }
 
 /*
@@ -541,25 +637,19 @@ smgrnblocks(SMgrRelation reln, ForkNumber forknum)
 }
 
 /*
- *	smgrtruncate() -- Truncate the given forks of supplied relation to
- *					  each specified numbers of blocks
+ *	smgrtruncate() -- Truncate supplied relation to the specified number
+ *					  of blocks
  *
  * The truncation is done immediately, so this can't be rolled back.
- *
- * The caller must hold AccessExclusiveLock on the relation, to ensure that
- * other backends receive the smgr invalidation event that this function sends
- * before they access any forks of the relation again.
  */
 void
-smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks, BlockNumber *nblocks)
+smgrtruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
 {
-	int			i;
-
 	/*
 	 * Get rid of any buffers for the about-to-be-deleted blocks. bufmgr will
 	 * just drop them without bothering to write the contents.
 	 */
-	DropRelFileNodeBuffers(reln->smgr_rnode, forknum, nforks, nblocks);
+	DropRelFileNodeBuffers(reln->smgr_rnode, forknum, nblocks);
 
 	/*
 	 * Send a shared-inval message to force other backends to close any smgr
@@ -573,24 +663,10 @@ smgrtruncate(SMgrRelation reln, ForkNumber *forknum, int nforks, BlockNumber *nb
 	 */
 	CacheInvalidateSmgr(reln->smgr_rnode);
 
-	/* Do the truncation */
-	for (i = 0; i < nforks; i++)
-	{
-		smgrsw[reln->smgr_which].smgr_truncate(reln, forknum[i], nblocks[i]);
-
-		/*
-		 * We might as well update the local smgr_fsm_nblocks and
-		 * smgr_vm_nblocks settings. The smgr cache inval message that this
-		 * function sent will cause other backends to invalidate their copies
-		 * of smgr_fsm_nblocks and smgr_vm_nblocks, and these ones too at the
-		 * next command boundary. But these ensure they aren't outright wrong
-		 * until then.
-		 */
-		if (forknum[i] == FSM_FORKNUM)
-			reln->smgr_fsm_nblocks = nblocks[i];
-		if (forknum[i] == VISIBILITYMAP_FORKNUM)
-			reln->smgr_vm_nblocks = nblocks[i];
-	}
+	/*
+	 * Do the truncation.
+	 */
+	smgrsw[reln->smgr_which].smgr_truncate(reln, forknum, nblocks);
 }
 
 /*

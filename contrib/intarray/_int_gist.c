@@ -5,10 +5,10 @@
 
 #include <limits.h>
 
-#include "_int.h"
 #include "access/gist.h"
-#include "access/reloptions.h"
 #include "access/stratnum.h"
+
+#include "_int.h"
 
 #define GETENTRY(vec,pos) ((ArrayType *) DatumGetPointer((vec)->vector[(pos)].key))
 
@@ -33,7 +33,6 @@ PG_FUNCTION_INFO_V1(g_int_penalty);
 PG_FUNCTION_INFO_V1(g_int_picksplit);
 PG_FUNCTION_INFO_V1(g_int_union);
 PG_FUNCTION_INFO_V1(g_int_same);
-PG_FUNCTION_INFO_V1(g_int_options);
 
 
 /*
@@ -158,7 +157,6 @@ g_int_compress(PG_FUNCTION_ARGS)
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	GISTENTRY  *retval;
 	ArrayType  *r;
-	int			num_ranges = G_INT_GET_NUMRANGES();
 	int			len,
 				lenr;
 	int		   *dr;
@@ -173,9 +171,9 @@ g_int_compress(PG_FUNCTION_ARGS)
 		CHECKARRVALID(r);
 		PREPAREARR(r);
 
-		if (ARRNELEMS(r) >= 2 * num_ranges)
+		if (ARRNELEMS(r) >= 2 * MAXNUMRANGE)
 			elog(NOTICE, "input array is too big (%d maximum allowed, %d current), use gist__intbig_ops opclass instead",
-				 2 * num_ranges - 1, ARRNELEMS(r));
+				 2 * MAXNUMRANGE - 1, ARRNELEMS(r));
 
 		retval = palloc(sizeof(GISTENTRY));
 		gistentryinit(*retval, PointerGetDatum(r),
@@ -198,7 +196,7 @@ g_int_compress(PG_FUNCTION_ARGS)
 		PG_RETURN_POINTER(entry);
 	}
 
-	if ((len = ARRNELEMS(r)) >= 2 * num_ranges)
+	if ((len = ARRNELEMS(r)) >= 2 * MAXNUMRANGE)
 	{							/* compress */
 		if (r == (ArrayType *) DatumGetPointer(entry->key))
 			r = DatumGetArrayTypePCopy(entry->key);
@@ -211,7 +209,7 @@ g_int_compress(PG_FUNCTION_ARGS)
 		 * "lenr" is the number of ranges we must eventually remove by
 		 * merging, we must be careful to remove no more than this number.
 		 */
-		lenr = len - num_ranges;
+		lenr = len - MAXNUMRANGE;
 
 		/*
 		 * Initially assume we can merge consecutive ints into a range. but we
@@ -244,7 +242,7 @@ g_int_compress(PG_FUNCTION_ARGS)
 		 */
 		len = 2 * (len - j);
 		cand = 1;
-		while (len > num_ranges * 2)
+		while (len > MAXNUMRANGE * 2)
 		{
 			min = PG_INT64_MAX;
 			for (i = 2; i < len; i += 2)
@@ -281,7 +279,6 @@ g_int_decompress(PG_FUNCTION_ARGS)
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
 	GISTENTRY  *retval;
 	ArrayType  *r;
-	int			num_ranges = G_INT_GET_NUMRANGES();
 	int		   *dr,
 				lenr;
 	ArrayType  *in;
@@ -308,7 +305,7 @@ g_int_decompress(PG_FUNCTION_ARGS)
 
 	lenin = ARRNELEMS(in);
 
-	if (lenin < 2 * num_ranges)
+	if (lenin < 2 * MAXNUMRANGE)
 	{							/* not compressed value */
 		if (in != (ArrayType *) DatumGetPointer(entry->key))
 		{
@@ -607,18 +604,4 @@ g_int_picksplit(PG_FUNCTION_ARGS)
 	v->spl_rdatum = PointerGetDatum(datum_r);
 
 	PG_RETURN_POINTER(v);
-}
-
-Datum
-g_int_options(PG_FUNCTION_ARGS)
-{
-	local_relopts *relopts = (local_relopts *) PG_GETARG_POINTER(0);
-
-	init_local_reloptions(relopts, sizeof(GISTIntArrayOptions));
-	add_local_int_reloption(relopts, "numranges",
-							"number of ranges for compression",
-							G_INT_NUMRANGES_DEFAULT, 1, G_INT_NUMRANGES_MAX,
-							offsetof(GISTIntArrayOptions, num_ranges));
-
-	PG_RETURN_VOID();
 }

@@ -7,7 +7,7 @@
  * numbers of equally-sized objects are allocated (and freed).
  *
  *
- * Portions Copyright (c) 2017-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2017-2019, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/mmgr/slab.c
@@ -40,7 +40,7 @@
  *
  *	For each block, we maintain pointer to the first free chunk - this is quite
  *	cheap and allows us to skip all the preceding used chunks, eliminating
- *	a significant number of lookups in many common usage patterns. In the worst
+ *	a significant number of lookups in many common usage patters. In the worst
  *	case this performs as if the pointer was not maintained.
  *
  *	We cache the freelist index for the blocks with the fewest free chunks
@@ -52,9 +52,10 @@
 
 #include "postgres.h"
 
-#include "lib/ilist.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
+#include "lib/ilist.h"
+
 
 /*
  * SlabContext is a specialized implementation of MemoryContext.
@@ -157,6 +158,22 @@ static const MemoryContextMethods SlabMethods = {
 #endif
 };
 
+/* ----------
+ * Debug macros
+ * ----------
+ */
+#ifdef HAVE_ALLOCINFO
+#define SlabFreeInfo(_cxt, _chunk) \
+			fprintf(stderr, "SlabFree: %s: %p, %zu\n", \
+				(_cxt)->header.name, (_chunk), (_chunk)->header.size)
+#define SlabAllocInfo(_cxt, _chunk) \
+			fprintf(stderr, "SlabAlloc: %s: %p, %zu\n", \
+				(_cxt)->header.name, (_chunk), (_chunk)->header.size)
+#else
+#define SlabFreeInfo(_cxt, _chunk)
+#define SlabAllocInfo(_cxt, _chunk)
+#endif
+
 
 /*
  * SlabContextCreate
@@ -168,7 +185,7 @@ static const MemoryContextMethods SlabMethods = {
  * chunkSize: allocation chunk size
  *
  * The chunkSize may not exceed:
- *		MAXALIGN_DOWN(SIZE_MAX) - MAXALIGN(sizeof(SlabBlock)) - sizeof(SlabChunk)
+ *		MAXALIGN_DOWN(SIZE_MAX) - MAXALIGN(sizeof(SlabBlock)) - SLAB_CHUNKHDRSZ
  */
 MemoryContext
 SlabContextCreate(MemoryContext parent,
@@ -217,11 +234,10 @@ SlabContextCreate(MemoryContext parent,
 	headerSize = offsetof(SlabContext, freelist) + freelistSize;
 
 #ifdef MEMORY_CONTEXT_CHECKING
-
 	/*
-	 * With memory checking, we need to allocate extra space for the bitmap of
-	 * free chunks. The bitmap is an array of bools, so we don't need to worry
-	 * about alignment.
+	 * With memory checking, we need to allocate extra space for the bitmap
+	 * of free chunks. The bitmap is an array of bools, so we don't need to
+	 * worry about alignment.
 	 */
 	headerSize += chunksPerBlock * sizeof(bool);
 #endif
@@ -307,14 +323,12 @@ SlabReset(MemoryContext context)
 #endif
 			free(block);
 			slab->nblocks--;
-			context->mem_allocated -= slab->blockSize;
 		}
 	}
 
 	slab->minFreeChunks = 0;
 
 	Assert(slab->nblocks == 0);
-	Assert(context->mem_allocated == 0);
 }
 
 /*
@@ -392,7 +406,6 @@ SlabAlloc(MemoryContext context, Size size)
 
 		slab->minFreeChunks = slab->chunksPerBlock;
 		slab->nblocks += 1;
-		context->mem_allocated += slab->blockSize;
 	}
 
 	/* grab the block from the freelist (even the new block is there) */
@@ -484,8 +497,7 @@ SlabAlloc(MemoryContext context, Size size)
 	randomize_mem((char *) SlabChunkGetPointer(chunk), size);
 #endif
 
-	Assert(slab->nblocks * slab->blockSize == context->mem_allocated);
-
+	SlabAllocInfo(slab, chunk);
 	return SlabChunkGetPointer(chunk);
 }
 
@@ -500,6 +512,8 @@ SlabFree(MemoryContext context, void *pointer)
 	SlabContext *slab = castNode(SlabContext, context);
 	SlabChunk  *chunk = SlabPointerGetChunk(pointer);
 	SlabBlock  *block = chunk->block;
+
+	SlabFreeInfo(slab, chunk);
 
 #ifdef MEMORY_CONTEXT_CHECKING
 	/* Test for someone scribbling on unused space in chunk */
@@ -559,13 +573,11 @@ SlabFree(MemoryContext context, void *pointer)
 	{
 		free(block);
 		slab->nblocks--;
-		context->mem_allocated -= slab->blockSize;
 	}
 	else
 		dlist_push_head(&slab->freelist[block->nfree], &block->node);
 
 	Assert(slab->nblocks >= 0);
-	Assert(slab->nblocks * slab->blockSize == context->mem_allocated);
 }
 
 /*
@@ -784,8 +796,6 @@ SlabCheck(MemoryContext context)
 					 name, block->nfree, block, nfree);
 		}
 	}
-
-	Assert(slab->nblocks * slab->blockSize == context->mem_allocated);
 }
 
 #endif							/* MEMORY_CONTEXT_CHECKING */

@@ -3,15 +3,18 @@
  *
  *	Postgres-version-specific routines
  *
- *	Copyright (c) 2010-2020, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2019, PostgreSQL Global Development Group
  *	src/bin/pg_upgrade/version.c
  */
 
 #include "postgres_fe.h"
 
+#include "pg_upgrade.h"
+
 #include "catalog/pg_class_d.h"
 #include "fe_utils/string_utils.h"
-#include "pg_upgrade.h"
+
+
 
 /*
  * new_9_0_populate_pg_largeobject_metadata()
@@ -156,7 +159,7 @@ check_for_data_type_usage(ClusterInfo *cluster, const char *typename,
 						  "				  a.atttypid = x.oid ",
 						  typename);
 
-		/* Ranges were introduced in 9.2 */
+		/* Ranges came in in 9.2 */
 		if (GET_MAJOR_VERSION(cluster->major_version) >= 902)
 			appendPQExpBuffer(&querybuf,
 							  "			UNION ALL "

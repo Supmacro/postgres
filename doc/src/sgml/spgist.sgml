@@ -1,6 +1,6 @@
 <!-- doc/src/sgml/spgist.sgml -->
 
-<chapter id="spgist" xreflabel="SP-GiST">
+<chapter id="spgist">
 <title>SP-GiST Indexes</title>
 
    <indexterm>
@@ -139,7 +139,6 @@
        <literal>|&amp;&gt;</literal>
       </entry>
       <entry>
-       <literal>&lt;-&gt;</literal>
       </entry>
      </row>
      <row>

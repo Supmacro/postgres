@@ -7,7 +7,7 @@
  * Splits jsonpath string into tokens represented as JsonPathString structs.
  * Decodes unicode and hex escaped strings.
  *
- * Copyright (c) 2019-2020, PostgreSQL Global Development Group
+ * Copyright (c) 2019, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	src/backend/utils/adt/jsonpath_scan.l
@@ -42,6 +42,8 @@ fprintf_to_ereport(const char *fmt, const char *msg)
 {
 	ereport(ERROR, (errmsg_internal("%s", msg)));
 }
+
+/* LCOV_EXCL_START */
 
 %}
 
@@ -271,6 +273,8 @@ hex_fail	\\x{hex_dig}{0,1}
 
 %%
 
+/* LCOV_EXCL_STOP */
+
 void
 jsonpath_yyerror(JsonPathParseResult **result, const char *message)
 {
@@ -323,7 +327,6 @@ static const JsonPathKeyword keywords[] = {
 	{ 6, false,	STRICT_P,	"strict"},
 	{ 7, false,	CEILING_P,	"ceiling"},
 	{ 7, false,	UNKNOWN_P,	"unknown"},
-	{ 8, false,	DATETIME_P,	"datetime"},
 	{ 8, false,	KEYVALUE_P,	"keyvalue"},
 	{ 10,false, LIKE_REGEX_P, "like_regex"},
 };
@@ -486,6 +489,13 @@ hexval(char c)
 static void
 addUnicodeChar(int ch)
 {
+	/*
+	 * For UTF8, replace the escape sequence by the actual
+	 * utf8 character in lex->strval. Do this also for other
+	 * encodings if the escape designates an ASCII character,
+	 * otherwise raise an error.
+	 */
+
 	if (ch == 0)
 	{
 		/* We can't allow this, since our TEXT type doesn't */
@@ -494,20 +504,40 @@ addUnicodeChar(int ch)
 				 errmsg("unsupported Unicode escape sequence"),
 				  errdetail("\\u0000 cannot be converted to text.")));
 	}
+	else if (GetDatabaseEncoding() == PG_UTF8)
+	{
+		char utf8str[5];
+		int utf8len;
+
+		unicode_to_utf8(ch, (unsigned char *) utf8str);
+		utf8len = pg_utf_mblen((unsigned char *) utf8str);
+		addstring(false, utf8str, utf8len);
+	}
+	else if (ch <= 0x007f)
+	{
+		/*
+		 * This is the only way to designate things like a
+		 * form feed character in JSON, so it's useful in all
+		 * encodings.
+		 */
+		addchar(false, (char) ch);
+	}
 	else
 	{
-		char		cbuf[MAX_UNICODE_EQUIVALENT_STRING + 1];
-
-		pg_unicode_to_server(ch, (unsigned char *) cbuf);
-		addstring(false, cbuf, strlen(cbuf));
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
+				 errmsg("invalid input syntax for type %s", "jsonpath"),
+				 errdetail("Unicode escape values cannot be used for code "
+						   "point values above 007F when the server encoding "
+						   "is not UTF8.")));
 	}
 }
 
-/* Add unicode character, processing any surrogate pairs */
+/* Add unicode character and process its hi surrogate */
 static void
 addUnicode(int ch, int *hi_surrogate)
 {
-	if (is_utf16_surrogate_first(ch))
+	if (ch >= 0xd800 && ch <= 0xdbff)
 	{
 		if (*hi_surrogate != -1)
 			ereport(ERROR,
@@ -515,10 +545,10 @@ addUnicode(int ch, int *hi_surrogate)
 					 errmsg("invalid input syntax for type %s", "jsonpath"),
 					 errdetail("Unicode high surrogate must not follow "
 							   "a high surrogate.")));
-		*hi_surrogate = ch;
+		*hi_surrogate = (ch & 0x3ff) << 10;
 		return;
 	}
-	else if (is_utf16_surrogate_second(ch))
+	else if (ch >= 0xdc00 && ch <= 0xdfff)
 	{
 		if (*hi_surrogate == -1)
 			ereport(ERROR,
@@ -526,7 +556,7 @@ addUnicode(int ch, int *hi_surrogate)
 					 errmsg("invalid input syntax for type %s", "jsonpath"),
 					 errdetail("Unicode low surrogate must follow a high "
 							   "surrogate.")));
-		ch = surrogate_pair_to_codepoint(*hi_surrogate, ch);
+		ch = 0x10000 + *hi_surrogate + (ch & 0x3ff);
 		*hi_surrogate = -1;
 	}
 	else if (*hi_surrogate != -1)

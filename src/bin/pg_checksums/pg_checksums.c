@@ -4,7 +4,7 @@
  *	  Checks, enables or disables page level checksums for an offline
  *	  cluster
  *
- * Copyright (c) 2010-2020, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2019, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/bin/pg_checksums/pg_checksums.c
@@ -88,8 +88,7 @@ usage(void)
 	printf(_("  -?, --help               show this help, then exit\n"));
 	printf(_("\nIf no data directory (DATADIR) is specified, "
 			 "the environment variable PGDATA\nis used.\n\n"));
-	printf(_("Report bugs to <%s>.\n"), PACKAGE_BUGREPORT);
-	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
+	printf(_("Report bugs to <pgsql-bugs@lists.postgresql.org>.\n"));
 }
 
 /*
@@ -244,7 +243,7 @@ scan_file(const char *fn, BlockNumber segmentno)
 		}
 		else if (mode == PG_MODE_ENABLE)
 		{
-			int			w;
+			int		w;
 
 			/* Set checksum in page header */
 			header->pd_checksum = csum;

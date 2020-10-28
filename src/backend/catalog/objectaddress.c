@@ -3,7 +3,7 @@
  * objectaddress.c
  *	  functions for working with ObjectAddresses
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -29,13 +29,13 @@
 #include "catalog/pg_attrdef.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_cast.h"
+#include "catalog/pg_default_acl.h"
+#include "catalog/pg_enum.h"
+#include "catalog/pg_event_trigger.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_conversion.h"
 #include "catalog/pg_database.h"
-#include "catalog/pg_default_acl.h"
-#include "catalog/pg_enum.h"
-#include "catalog/pg_event_trigger.h"
 #include "catalog/pg_extension.h"
 #include "catalog/pg_foreign_data_wrapper.h"
 #include "catalog/pg_foreign_server.h"
@@ -44,10 +44,10 @@
 #include "catalog/pg_largeobject_metadata.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
-#include "catalog/pg_operator.h"
 #include "catalog/pg_opfamily.h"
-#include "catalog/pg_policy.h"
+#include "catalog/pg_operator.h"
 #include "catalog/pg_proc.h"
+#include "catalog/pg_policy.h"
 #include "catalog/pg_publication.h"
 #include "catalog/pg_publication_rel.h"
 #include "catalog/pg_rewrite.h"
@@ -81,7 +81,6 @@
 #include "storage/large_object.h"
 #include "storage/lmgr.h"
 #include "storage/sinval.h"
-#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -531,7 +530,7 @@ static const ObjectPropertyType ObjectProperty[] =
 
 /*
  * This struct maps the string object types as returned by
- * getObjectTypeDescription into ObjectType enum values.  Note that some enum
+ * getObjectTypeDescription into ObjType enum values.  Note that some enum
  * values can be obtained by different names, and that some string object types
  * do not have corresponding values in the output enum.  The user of this map
  * must be careful to test for invalid values being returned.
@@ -1968,7 +1967,7 @@ textarray_to_strvaluelist(ArrayType *arr)
 	List	   *list = NIL;
 	int			i;
 
-	deconstruct_array(arr, TEXTOID, -1, false, TYPALIGN_INT,
+	deconstruct_array(arr, TEXTOID, -1, false, 'i',
 					  &elems, &nulls, &nelems);
 
 	for (i = 0; i < nelems; i++)
@@ -2025,7 +2024,7 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 		bool	   *nulls;
 		int			nelems;
 
-		deconstruct_array(namearr, TEXTOID, -1, false, TYPALIGN_INT,
+		deconstruct_array(namearr, TEXTOID, -1, false, 'i',
 						  &elems, &nulls, &nelems);
 		if (nelems != 1)
 			ereport(ERROR,
@@ -2043,7 +2042,7 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 		bool	   *nulls;
 		int			nelems;
 
-		deconstruct_array(namearr, TEXTOID, -1, false, TYPALIGN_INT,
+		deconstruct_array(namearr, TEXTOID, -1, false, 'i',
 						  &elems, &nulls, &nelems);
 		if (nelems != 1)
 			ereport(ERROR,
@@ -2082,7 +2081,7 @@ pg_get_object_address(PG_FUNCTION_ARGS)
 		int			nelems;
 		int			i;
 
-		deconstruct_array(argsarr, TEXTOID, -1, false, TYPALIGN_INT,
+		deconstruct_array(argsarr, TEXTOID, -1, false, 'i',
 						  &elems, &nulls, &nelems);
 
 		args = NIL;
@@ -5334,7 +5333,7 @@ strlist_to_textarray(List *list)
 
 	lb[0] = 1;
 	arr = construct_md_array(datums, nulls, 1, &j,
-							 lb, TEXTOID, -1, false, TYPALIGN_INT);
+							 lb, TEXTOID, -1, false, 'i');
 
 	MemoryContextDelete(memcxt);
 

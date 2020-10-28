@@ -2,7 +2,7 @@
  *
  * createuser
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/bin/scripts/createuser.c
@@ -43,6 +43,9 @@ main(int argc, char *argv[])
 		{"replication", no_argument, NULL, 1},
 		{"no-replication", no_argument, NULL, 2},
 		{"interactive", no_argument, NULL, 3},
+		/* adduser is obsolete, undocumented spelling of superuser */
+		{"adduser", no_argument, NULL, 'a'},
+		{"no-adduser", no_argument, NULL, 'A'},
 		{"connection-limit", required_argument, NULL, 'c'},
 		{"pwprompt", no_argument, NULL, 'P'},
 		{"encrypted", no_argument, NULL, 'E'},
@@ -85,10 +88,10 @@ main(int argc, char *argv[])
 
 	handle_help_version_opts(argc, argv, "createuser", help);
 
-	while ((c = getopt_long(argc, argv, "h:p:U:g:wWedDsSrRiIlLc:PE",
+	while ((c = getopt_long(argc, argv, "h:p:U:g:wWedDsSaArRiIlLc:PE",
 							long_options, &optindex)) != -1)
 	{
-		char	   *endptr;
+		char   *endptr;
 
 		switch (c)
 		{
@@ -120,9 +123,11 @@ main(int argc, char *argv[])
 				createdb = TRI_NO;
 				break;
 			case 's':
+			case 'a':
 				superuser = TRI_YES;
 				break;
 			case 'S':
+			case 'A':
 				superuser = TRI_NO;
 				break;
 			case 'r':
@@ -145,7 +150,7 @@ main(int argc, char *argv[])
 				break;
 			case 'c':
 				conn_limit = strtol(optarg, &endptr, 10);
-				if (*endptr != '\0' || conn_limit < -1) /* minimum valid value */
+				if (*endptr != '\0' || conn_limit < -1)	/* minimum valid value */
 				{
 					pg_log_error("invalid value for --connection-limit: %s",
 								 optarg);
@@ -374,6 +379,5 @@ help(const char *progname)
 	printf(_("  -U, --username=USERNAME   user name to connect as (not the one to create)\n"));
 	printf(_("  -w, --no-password         never prompt for password\n"));
 	printf(_("  -W, --password            force password prompt\n"));
-	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);
-	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
+	printf(_("\nReport bugs to <pgsql-bugs@lists.postgresql.org>.\n"));
 }

@@ -4,7 +4,7 @@
  * reads the data from $PGDATA/global/pg_control
  *
  * copyright (c) Oliver Elphick <olly@lfix.co.uk>, 2001;
- * license: BSD
+ * licence: BSD
  *
  * src/bin/pg_controldata/pg_controldata.c
  */
@@ -26,8 +26,9 @@
 #include "catalog/pg_control.h"
 #include "common/controldata_utils.h"
 #include "common/logging.h"
-#include "getopt_long.h"
 #include "pg_getopt.h"
+#include "getopt_long.h"
+
 
 static void
 usage(const char *progname)
@@ -41,8 +42,7 @@ usage(const char *progname)
 	printf(_("  -?, --help             show this help, then exit\n"));
 	printf(_("\nIf no data directory (DATADIR) is specified, "
 			 "the environment variable PGDATA\nis used.\n\n"));
-	printf(_("Report bugs to <%s>.\n"), PACKAGE_BUGREPORT);
-	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
+	printf(_("Report bugs to <pgsql-bugs@lists.postgresql.org>.\n"));
 }
 
 
@@ -99,6 +99,7 @@ main(int argc, char *argv[])
 	time_t		time_tmp;
 	char		pgctime_str[128];
 	char		ckpttime_str[128];
+	char		sysident_str[32];
 	char		mock_auth_nonce_str[MOCK_AUTH_NONCE_LEN * 2 + 1];
 	const char *strftime_fmt = "%c";
 	const char *progname;
@@ -221,6 +222,13 @@ main(int argc, char *argv[])
 	else
 		strcpy(xlogfilename, _("???"));
 
+	/*
+	 * Format system_identifier and mock_authentication_nonce separately to
+	 * keep platform-dependent format code out of the translatable message
+	 * string.
+	 */
+	snprintf(sysident_str, sizeof(sysident_str), UINT64_FORMAT,
+			 ControlFile->system_identifier);
 	for (i = 0; i < MOCK_AUTH_NONCE_LEN; i++)
 		snprintf(&mock_auth_nonce_str[i * 2], 3, "%02x",
 				 (unsigned char) ControlFile->mock_authentication_nonce[i]);
@@ -229,8 +237,8 @@ main(int argc, char *argv[])
 		   ControlFile->pg_control_version);
 	printf(_("Catalog version number:               %u\n"),
 		   ControlFile->catalog_version_no);
-	printf(_("Database system identifier:           %llu\n"),
-		   (unsigned long long) ControlFile->system_identifier);
+	printf(_("Database system identifier:           %s\n"),
+		   sysident_str);
 	printf(_("Database cluster state:               %s\n"),
 		   dbState(ControlFile->state));
 	printf(_("pg_control last modified:             %s\n"),
@@ -328,6 +336,8 @@ main(int argc, char *argv[])
 	/* This is no longer configurable, but users may still expect to see it: */
 	printf(_("Date/time type storage:               %s\n"),
 		   _("64-bit integers"));
+	printf(_("Float4 argument passing:              %s\n"),
+		   (ControlFile->float4ByVal ? _("by value") : _("by reference")));
 	printf(_("Float8 argument passing:              %s\n"),
 		   (ControlFile->float8ByVal ? _("by value") : _("by reference")));
 	printf(_("Data page checksum version:           %u\n"),

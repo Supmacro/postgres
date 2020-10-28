@@ -6,7 +6,7 @@
  * loaded as a dynamic module to avoid linking the main server binary with
  * libpq.
  *
- * Portions Copyright (c) 2010-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2019, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -19,14 +19,15 @@
 #include <unistd.h>
 #include <sys/time.h>
 
+#include "libpq-fe.h"
+#include "pqexpbuffer.h"
 #include "access/xlog.h"
 #include "catalog/pg_type.h"
+#include "common/connect.h"
 #include "funcapi.h"
-#include "libpq-fe.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "pgstat.h"
-#include "pqexpbuffer.h"
 #include "replication/walreceiver.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
@@ -74,7 +75,6 @@ static char *libpqrcv_create_slot(WalReceiverConn *conn,
 								  bool temporary,
 								  CRSSnapshotAction snapshot_action,
 								  XLogRecPtr *lsn);
-static pid_t libpqrcv_get_backend_pid(WalReceiverConn *conn);
 static WalRcvExecResult *libpqrcv_exec(WalReceiverConn *conn,
 									   const char *query,
 									   const int nRetTypes,
@@ -94,7 +94,6 @@ static WalReceiverFunctionsType PQWalReceiverFunctions = {
 	libpqrcv_receive,
 	libpqrcv_send,
 	libpqrcv_create_slot,
-	libpqrcv_get_backend_pid,
 	libpqrcv_exec,
 	libpqrcv_disconnect
 };
@@ -211,6 +210,22 @@ libpqrcv_connect(const char *conninfo, bool logical, const char *appname,
 	{
 		*err = pchomp(PQerrorMessage(conn->streamConn));
 		return NULL;
+	}
+
+	if (logical)
+	{
+		PGresult   *res;
+
+		res = libpqrcv_PQexec(conn->streamConn,
+							  ALWAYS_SECURE_SEARCH_PATH_SQL);
+		if (PQresultStatus(res) != PGRES_TUPLES_OK)
+		{
+			PQclear(res);
+			ereport(ERROR,
+					(errmsg("could not clear search path: %s",
+							pchomp(PQerrorMessage(conn->streamConn)))));
+		}
+		PQclear(res);
 	}
 
 	conn->logical = logical;
@@ -834,10 +849,6 @@ libpqrcv_create_slot(WalReceiverConn *conn, const char *slotname,
 				break;
 		}
 	}
-	else
-	{
-		appendStringInfoString(&cmd, " PHYSICAL RESERVE_WAL");
-	}
 
 	res = libpqrcv_PQexec(conn->streamConn, cmd.data);
 	pfree(cmd.data);
@@ -850,10 +861,8 @@ libpqrcv_create_slot(WalReceiverConn *conn, const char *slotname,
 						slotname, pchomp(PQerrorMessage(conn->streamConn)))));
 	}
 
-	if (lsn)
-		*lsn = DatumGetLSN(DirectFunctionCall1Coll(pg_lsn_in, InvalidOid,
-												   CStringGetDatum(PQgetvalue(res, 0, 1))));
-
+	*lsn = DatumGetLSN(DirectFunctionCall1Coll(pg_lsn_in, InvalidOid,
+											   CStringGetDatum(PQgetvalue(res, 0, 1))));
 	if (!PQgetisnull(res, 0, 2))
 		snapshot = pstrdup(PQgetvalue(res, 0, 2));
 	else
@@ -862,15 +871,6 @@ libpqrcv_create_slot(WalReceiverConn *conn, const char *slotname,
 	PQclear(res);
 
 	return snapshot;
-}
-
-/*
- * Return PID of remote backend process.
- */
-static pid_t
-libpqrcv_get_backend_pid(WalReceiverConn *conn)
-{
-	return PQbackendPID(conn->streamConn);
 }
 
 /*

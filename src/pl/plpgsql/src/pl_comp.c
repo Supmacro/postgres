@@ -3,7 +3,7 @@
  * pl_comp.c		- Compiler part of the PL/pgSQL
  *			  procedural language
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,7 +24,6 @@
 #include "funcapi.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_type.h"
-#include "plpgsql.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -33,6 +32,9 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
+
+#include "plpgsql.h"
+
 
 /* ----------
  * Our own local and global variables
@@ -507,13 +509,11 @@ do_compile(FunctionCallInfo fcinfo,
 			{
 				if (forValidator)
 				{
-					if (rettypeid == ANYARRAYOID ||
-						rettypeid == ANYCOMPATIBLEARRAYOID)
+					if (rettypeid == ANYARRAYOID)
 						rettypeid = INT4ARRAYOID;
-					else if (rettypeid == ANYRANGEOID ||
-							 rettypeid == ANYCOMPATIBLERANGEOID)
+					else if (rettypeid == ANYRANGEOID)
 						rettypeid = INT4RANGEOID;
-					else		/* ANYELEMENT or ANYNONARRAY or ANYCOMPATIBLE */
+					else		/* ANYELEMENT or ANYNONARRAY */
 						rettypeid = INT4OID;
 					/* XXX what could we use for ANYENUM? */
 				}
@@ -2127,13 +2127,13 @@ build_datatype(HeapTuple typeTup, int32 typmod,
 		 */
 		typ->typisarray = (typeStruct->typlen == -1 &&
 						   OidIsValid(typeStruct->typelem) &&
-						   typeStruct->typstorage != TYPSTORAGE_PLAIN);
+						   typeStruct->typstorage != 'p');
 	}
 	else if (typeStruct->typtype == TYPTYPE_DOMAIN)
 	{
 		/* we can short-circuit looking up base types if it's not varlena */
 		typ->typisarray = (typeStruct->typlen == -1 &&
-						   typeStruct->typstorage != TYPSTORAGE_PLAIN &&
+						   typeStruct->typstorage != 'p' &&
 						   OidIsValid(get_base_element_type(typeStruct->typbasetype)));
 	}
 	else
@@ -2495,16 +2495,12 @@ plpgsql_resolve_polymorphic_argtypes(int numargs,
 				case ANYELEMENTOID:
 				case ANYNONARRAYOID:
 				case ANYENUMOID:	/* XXX dubious */
-				case ANYCOMPATIBLEOID:
-				case ANYCOMPATIBLENONARRAYOID:
 					argtypes[i] = INT4OID;
 					break;
 				case ANYARRAYOID:
-				case ANYCOMPATIBLEARRAYOID:
 					argtypes[i] = INT4ARRAYOID;
 					break;
 				case ANYRANGEOID:
-				case ANYCOMPATIBLERANGEOID:
 					argtypes[i] = INT4RANGEOID;
 					break;
 				default:
@@ -2539,7 +2535,7 @@ delete_function(PLpgSQL_function *func)
 		plpgsql_free_function_memory(func);
 }
 
-/* exported so we can call it from _PG_init() */
+/* exported so we can call it from plpgsql_init() */
 void
 plpgsql_HashTableInit(void)
 {

@@ -388,15 +388,11 @@ $$ LANGUAGE SQL;
     </para>
 
     <para>
-     If the final <literal>SELECT</literal> or <literal>RETURNING</literal>
-     clause in a <acronym>SQL</acronym> function does not return exactly
-     the function's declared result
-     type, <productname>PostgreSQL</productname> will automatically cast
-     the value to the required type, if that is possible with an implicit
-     or assignment cast.  Otherwise, you must write an explicit cast.
+     A <acronym>SQL</acronym> function must return exactly its declared
+     result type.  This may require inserting an explicit cast.
      For example, suppose we wanted the
      previous <function>add_em</function> function to return
-     type <type>float8</type> instead.  It's sufficient to write
+     type <type>float8</type> instead.  This won't work:
 
 <programlisting>
 CREATE FUNCTION add_em(integer, integer) RETURNS float8 AS $$
@@ -404,10 +400,16 @@ CREATE FUNCTION add_em(integer, integer) RETURNS float8 AS $$
 $$ LANGUAGE SQL;
 </programlisting>
 
-     since the <type>integer</type> sum can be implicitly cast
-     to <type>float8</type>.
-     (See <xref linkend="typeconv"/> or <xref linkend="sql-createcast"/>
-     for more about casts.)
+     even though in other contexts <productname>PostgreSQL</productname>
+     would be willing to insert an implicit cast to
+     convert <type>integer</type> to <type>float8</type>.
+     We need to write it as
+
+<programlisting>
+CREATE FUNCTION add_em(integer, integer) RETURNS float8 AS $$
+    SELECT ($1 + $2)::float8;
+$$ LANGUAGE SQL;
+</programlisting>
     </para>
    </sect2>
 
@@ -501,24 +503,23 @@ $$ LANGUAGE SQL;
       <listitem>
        <para>
         The select list order in the query must be exactly the same as
-        that in which the columns appear in the composite type.
-        (Naming the columns, as we did above,
+        that in which the columns appear in the table associated
+        with the composite type.  (Naming the columns, as we did above,
         is irrelevant to the system.)
        </para>
       </listitem>
       <listitem>
        <para>
-        We must ensure each expression's type can be cast to that of
-        the corresponding column of the composite type.
+        We must ensure each expression's type matches the corresponding
+        column of the composite type, inserting a cast if necessary.
         Otherwise we'll get errors like this:
 <screen>
 <computeroutput>
-ERROR:  return type mismatch in function declared to return emp
-DETAIL:  Final statement returns text instead of point at column 4.
+ERROR:  function declared to return emp returns varchar instead of text at column 1
 </computeroutput>
 </screen>
-        As with the base-type case, the system will not insert explicit
-        casts automatically, only implicit or assignment casts.
+        As with the base-type case, the function will not insert any casts
+        automatically.
        </para>
       </listitem>
      </itemizedlist>
@@ -541,7 +542,8 @@ $$ LANGUAGE SQL;
      Another example is that if we are trying to write a function that
      returns a domain over composite, rather than a plain composite type,
      it is always necessary to write it as returning a single column,
-     since there is no way to cause a coercion of the whole row result.
+     since there is no other way to produce a value that is exactly of
+     the domain type.
     </para>
 
     <para>
@@ -1226,13 +1228,16 @@ $$ LANGUAGE SQL;
     </para>
    </sect2>
 
-   <sect2 id="xfunc-sql-polymorphic-functions">
+   <sect2>
     <title>Polymorphic <acronym>SQL</acronym> Functions</title>
 
     <para>
      <acronym>SQL</acronym> functions can be declared to accept and
-     return the polymorphic types described in <xref
-     linkend="extend-types-polymorphic"/>.  Here is a polymorphic
+     return the polymorphic types <type>anyelement</type>,
+     <type>anyarray</type>, <type>anynonarray</type>,
+     <type>anyenum</type>, and <type>anyrange</type>.  See <xref
+     linkend="extend-types-polymorphic"/> for a more detailed
+     explanation of polymorphic functions. Here is a polymorphic
      function <function>make_array</function> that builds up an array
      from two arbitrary data type elements:
 <screen>
@@ -1257,43 +1262,9 @@ SELECT make_array(1, 2) AS intarray, make_array('a'::text, 'b') AS textarray;
      type.
      Without the typecast, you will get errors like this:
 <screen>
-ERROR:  could not determine polymorphic type because input has type unknown
-</screen>
-    </para>
-
-    <para>
-     With <function>make_array</function> declared as above, you must
-     provide two arguments that are of exactly the same data type; the
-     system will not attempt to resolve any type differences.  Thus for
-     example this does not work:
-<screen>
-SELECT make_array(1, 2.5) AS numericarray;
-ERROR:  function make_array(integer, numeric) does not exist
-</screen>
-     An alternative approach is to use the <quote>common</quote> family of
-     polymorphic types, which allows the system to try to identify a
-     suitable common type:
-<screen>
-CREATE FUNCTION make_array2(anycompatible, anycompatible)
-RETURNS anycompatiblearray AS $$
-    SELECT ARRAY[$1, $2];
-$$ LANGUAGE SQL;
-
-SELECT make_array2(1, 2.5) AS numericarray;
- numericarray
---------------
- {1,2.5}
-(1 row)
-</screen>
-     Because the rules for common type resolution default to choosing
-     type <type>text</type> when all inputs are of unknown types, this
-     also works:
-<screen>
-SELECT make_array2('a', 'b') AS textarray;
- textarray 
------------
- {a,b}
-(1 row)
+<computeroutput>
+ERROR:  could not determine polymorphic type because input has type "unknown"
+</computeroutput>
 </screen>
     </para>
 
@@ -1315,7 +1286,7 @@ CREATE FUNCTION invalid_func() RETURNS anyelement AS $$
     SELECT 1;
 $$ LANGUAGE SQL;
 ERROR:  cannot determine result data type
-DETAIL:  A result of type anyelement requires at least one input of type anyelement, anyarray, anynonarray, anyenum, or anyrange.
+DETAIL:  A function returning a polymorphic type must have at least one polymorphic argument.
 </screen>
     </para>
 
@@ -2084,9 +2055,6 @@ memcpy(destination->data, buffer, 40);
      <table tocentry="1" id="xfunc-c-type-table">
       <title>Equivalent C Types for Built-in SQL Types</title>
       <tgroup cols="3">
-       <colspec colname="col1" colwidth="1*"/>
-       <colspec colname="col2" colwidth="1*"/>
-       <colspec colname="col3" colwidth="2*"/>
        <thead>
         <row>
          <entry>
@@ -3191,9 +3159,11 @@ CREATE OR REPLACE FUNCTION retcomposite(IN integer, IN integer,
 
     <para>
      C-language functions can be declared to accept and
-     return the polymorphic types described in <xref
-     linkend="extend-types-polymorphic"/>.
-     When a function's arguments or return types
+     return the polymorphic types
+     <type>anyelement</type>, <type>anyarray</type>, <type>anynonarray</type>,
+     <type>anyenum</type>, and <type>anyrange</type>.
+     See <xref linkend="extend-types-polymorphic"/> for a more detailed explanation
+     of polymorphic functions. When function arguments or return types
      are defined as polymorphic types, the function author cannot know
      in advance what data type it will be called with, or
      need to return. There are two routines provided in <filename>fmgr.h</filename>
@@ -3297,7 +3267,7 @@ CREATE FUNCTION make_array(anyelement) RETURNS anyarray
     </para>
    </sect2>
 
-   <sect2 id="xfunc-shared-addin">
+   <sect2>
     <title>Shared Memory and LWLocks</title>
 
     <para>

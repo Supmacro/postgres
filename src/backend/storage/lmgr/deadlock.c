@@ -7,7 +7,7 @@
  * detection and resolution algorithms.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -554,15 +554,6 @@ FindLockCycleRecurseMember(PGPROC *checkProc,
 	int			i;
 	int			numLockModes,
 				lm;
-
-	/*
-	 * The relation extension or page lock can never participate in actual
-	 * deadlock cycle.  See Asserts in LockAcquireExtended.  So, there is no
-	 * advantage in checking wait edges from them.
-	 */
-	if (LOCK_LOCKTAG(*lock) == LOCKTAG_RELATION_EXTEND ||
-		(LOCK_LOCKTAG(*lock) == LOCKTAG_PAGE))
-		return false;
 
 	lockMethodTable = GetLocksMethodTable(lock);
 	numLockModes = lockMethodTable->numLockModes;
@@ -1130,7 +1121,7 @@ DeadLockReport(void)
 	}
 
 	/* Duplicate all the above for the server ... */
-	appendBinaryStringInfo(&logbuf, clientbuf.data, clientbuf.len);
+	appendStringInfoString(&logbuf, clientbuf.data);
 
 	/* ... and add info about query strings */
 	for (i = 0; i < nDeadlockDetails; i++)

@@ -2,7 +2,7 @@
 #
 # Makefile for ecpg pgtypes library
 #
-# Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+# Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
 # Portions Copyright (c) 1994, Regents of the University of California
 #
 # src/interfaces/ecpg/pgtypeslib/Makefile
@@ -28,14 +28,8 @@ SHLIB_PREREQS = submake-libpgport
 
 SHLIB_EXPORTS = exports.txt
 
-OBJS = \
-	$(WIN32RES) \
-	common.o \
-	datetime.o \
-	dt_common.o \
-	interval.o \
-	numeric.o \
-	timestamp.o
+OBJS= numeric.o datetime.o common.o dt_common.o timestamp.o interval.o \
+	$(WIN32RES)
 
 all: all-lib
 
@@ -51,4 +45,4 @@ uninstall: uninstall-lib
 clean distclean: clean-lib
 	rm -f $(OBJS)
 
-maintainer-clean: distclean
+maintainer-clean: distclean maintainer-clean-lib

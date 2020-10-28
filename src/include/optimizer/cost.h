@@ -4,7 +4,7 @@
  *	  prototypes for costsize.c and clausesel.c.
  *
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/cost.h
@@ -53,10 +53,7 @@ extern PGDLLIMPORT bool enable_indexonlyscan;
 extern PGDLLIMPORT bool enable_bitmapscan;
 extern PGDLLIMPORT bool enable_tidscan;
 extern PGDLLIMPORT bool enable_sort;
-extern PGDLLIMPORT bool enable_incrementalsort;
 extern PGDLLIMPORT bool enable_hashagg;
-extern PGDLLIMPORT bool enable_hashagg_disk;
-extern PGDLLIMPORT bool enable_groupingsets_hash_disk;
 extern PGDLLIMPORT bool enable_nestloop;
 extern PGDLLIMPORT bool enable_material;
 extern PGDLLIMPORT bool enable_mergejoin;
@@ -104,11 +101,6 @@ extern void cost_sort(Path *path, PlannerInfo *root,
 					  List *pathkeys, Cost input_cost, double tuples, int width,
 					  Cost comparison_cost, int sort_mem,
 					  double limit_tuples);
-extern void cost_incremental_sort(Path *path,
-								  PlannerInfo *root, List *pathkeys, int presorted_keys,
-								  Cost input_startup_cost, Cost input_total_cost,
-								  double input_tuples, int width, Cost comparison_cost, int sort_mem,
-								  double limit_tuples);
 extern void cost_append(AppendPath *path);
 extern void cost_merge_append(Path *path, PlannerInfo *root,
 							  List *pathkeys, int n_streams,
@@ -122,7 +114,7 @@ extern void cost_agg(Path *path, PlannerInfo *root,
 					 int numGroupCols, double numGroups,
 					 List *quals,
 					 Cost input_startup_cost, Cost input_total_cost,
-					 double input_tuples, double input_width);
+					 double input_tuples);
 extern void cost_windowagg(Path *path, PlannerInfo *root,
 						   List *windowFuncs, int numPartCols, int numOrderCols,
 						   Cost input_startup_cost, Cost input_total_cost,

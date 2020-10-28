@@ -1,42 +1,9 @@
-
-=pod
-
-=head1 NAME
-
-TestLib - helper module for writing PostgreSQL's C<prove> tests.
-
-=head1 SYNOPSIS
-
-  use TestLib;
-
-  # Test basic output of a command
-  program_help_ok('initdb');
-  program_version_ok('initdb');
-  program_options_handling_ok('initdb');
-
-  # Test option combinations
-  command_fails(['initdb', '--invalid-option'],
-              'command fails with invalid option');
-  my $tempdir = TestLib::tempdir;
-  command_ok('initdb', '-D', $tempdir);
-
-  # Miscellanea
-  print "on Windows" if $TestLib::windows_os;
-  my $path = TestLib::perl2host($backup_dir);
-  ok(check_mode_recursive($stream_dir, 0700, 0600),
-    "check stream dir permissions");
-  TestLib::system_log('pg_ctl', 'kill', 'QUIT', $slow_pid);
-
-=head1 DESCRIPTION
-
-C<TestLib> contains a set of routines dedicated to environment setup for
-a PostgreSQL regression test run and includes some low-level routines
-aimed at controlling command execution, logging and test functions.
-
-=cut
-
-# This module should never depend on any other PostgreSQL regression test
-# modules.
+# TestLib, low-level routines and actions regression tests.
+#
+# This module contains a set of routines dedicated to environment setup for
+# a PostgreSQL regression test run and includes some low-level routines
+# aimed at controlling command execution, logging and test functions. This
+# module should never depend on any other PostgreSQL regression test modules.
 
 package TestLib;
 
@@ -55,8 +22,7 @@ use File::Temp ();
 use IPC::Run;
 use SimpleTee;
 
-# specify a recent enough version of Test::More to support the
-# done_testing() function
+# specify a recent enough version of Test::More to support the done_testing() function
 use Test::More 0.87;
 
 our @EXPORT = qw(
@@ -84,10 +50,9 @@ our @EXPORT = qw(
   command_checks_all
 
   $windows_os
-  $use_unix_sockets
 );
 
-our ($windows_os, $use_unix_sockets, $tmp_check, $log_path, $test_logfile);
+our ($windows_os, $tmp_check, $log_path, $test_logfile);
 
 BEGIN
 {
@@ -114,32 +79,7 @@ BEGIN
 
 	# Must be set early
 	$windows_os = $Config{osname} eq 'MSWin32' || $Config{osname} eq 'msys';
-	if ($windows_os)
-	{
-		require Win32API::File;
-		Win32API::File->import(qw(createFile OsFHandleOpen CloseHandle));
-	}
-
-	# Specifies whether to use Unix sockets for test setups.  On
-	# Windows we don't use them by default since it's not universally
-	# supported, but it can be overridden if desired.
-	$use_unix_sockets =
-	  (!$windows_os || defined $ENV{PG_TEST_USE_UNIX_SOCKETS});
 }
-
-=pod
-
-=head1 EXPORTED VARIABLES
-
-=over
-
-=item C<$windows_os>
-
-Set to true when running under Windows, except on Cygwin.
-
-=back
-
-=cut
 
 INIT
 {
@@ -200,20 +140,9 @@ END
 	$File::Temp::KEEP_ALL = 1 unless $? == 0 && all_tests_passing();
 }
 
-=pod
-
-=head1 ROUTINES
-
-=over
-
-=item all_tests_passing()
-
-Return 1 if all the tests run so far have passed. Otherwise, return 0.
-
-=cut
-
 sub all_tests_passing
 {
+	my $fail_count = 0;
 	foreach my $status (Test::More->builder->summary)
 	{
 		return 0 unless $status;
@@ -221,19 +150,9 @@ sub all_tests_passing
 	return 1;
 }
 
-=pod
-
-=item tempdir(prefix)
-
-Securely create a temporary directory inside C<$tmp_check>, like C<mkdtemp>,
-and return its name.  The directory will be removed automatically at the
-end of the tests.
-
-If C<prefix> is given, the new directory is templated as C<${prefix}_XXXX>.
-Otherwise the template is C<tmp_test_XXXX>.
-
-=cut
-
+#
+# Helper functions
+#
 sub tempdir
 {
 	my ($prefix) = @_;
@@ -244,31 +163,17 @@ sub tempdir
 		CLEANUP => 1);
 }
 
-=pod
-
-=item tempdir_short()
-
-As above, but the directory is outside the build tree so that it has a short
-name, to avoid path length issues.
-
-=cut
-
 sub tempdir_short
 {
 
+	# Use a separate temp dir outside the build tree for the
+	# Unix-domain socket, to avoid file name length issues.
 	return File::Temp::tempdir(CLEANUP => 1);
 }
 
-=pod
-
-=item perl2host()
-
-Translate a Perl file name to a host file name.  Currently, this is a no-op
-except for the case of Perl=msys and host=mingw32.  The subject need not
-exist, but its parent directory must exist.
-
-=cut
-
+# Translate a Perl file name to a host file name.  Currently, this is a no-op
+# except for the case of Perl=msys and host=mingw32.  The subject need not
+# exist, but its parent directory must exist.
 sub perl2host
 {
 	my ($subject) = @_;
@@ -293,30 +198,11 @@ sub perl2host
 	return $dir . $leaf;
 }
 
-=pod
-
-=item system_log(@cmd)
-
-Run (via C<system()>) the command passed as argument; the return
-value is passed through.
-
-=cut
-
 sub system_log
 {
 	print("# Running: " . join(" ", @_) . "\n");
 	return system(@_);
 }
-
-=pod
-
-=item system_or_bail(@cmd)
-
-Run (via C<system()>) the command passed as argument, and returns
-if the command is successful.
-On failure, abandon further tests and exit the program.
-
-=cut
 
 sub system_or_bail
 {
@@ -327,30 +213,11 @@ sub system_or_bail
 	return;
 }
 
-=pod
-
-=item run_log(@cmd)
-
-Run the given command via C<IPC::Run::run()>, noting it in the log.
-The return value from the command is passed through.
-
-=cut
-
 sub run_log
 {
 	print("# Running: " . join(" ", @{ $_[0] }) . "\n");
 	return IPC::Run::run(@_);
 }
-
-=pod
-
-=item run_command(cmd)
-
-Run (via C<IPC::Run::run()>) the command passed as argument.
-The return value from the command is ignored.
-The return value is C<($stdout, $stderr)>.
-
-=cut
 
 sub run_command
 {
@@ -362,14 +229,7 @@ sub run_command
 	return ($stdout, $stderr);
 }
 
-=pod
-
-=item generate_ascii_string(from_char, to_char)
-
-Generate a string made of the given range of ASCII characters.
-
-=cut
-
+# Generate a string made of the given range of ASCII characters
 sub generate_ascii_string
 {
 	my ($from_char, $to_char) = @_;
@@ -382,14 +242,6 @@ sub generate_ascii_string
 	return $res;
 }
 
-=pod
-
-=item slurp_dir(dir)
-
-Return the complete list of entries in the specified directory.
-
-=cut
-
 sub slurp_dir
 {
 	my ($dir) = @_;
@@ -400,48 +252,17 @@ sub slurp_dir
 	return @direntries;
 }
 
-=pod
-
-=item slurp_file(filename)
-
-Return the full contents of the specified file.
-
-=cut
-
 sub slurp_file
 {
 	my ($filename) = @_;
 	local $/;
-	my $contents;
-	if ($Config{osname} ne 'MSWin32')
-	{
-		open(my $in, '<', $filename)
-		  or die "could not read \"$filename\": $!";
-		$contents = <$in>;
-		close $in;
-	}
-	else
-	{
-		my $fHandle = createFile($filename, "r", "rwd")
-		  or die "could not open \"$filename\": $^E";
-		OsFHandleOpen(my $fh = IO::Handle->new(), $fHandle, 'r')
-		  or die "could not read \"$filename\": $^E\n";
-		$contents = <$fh>;
-		CloseHandle($fHandle)
-		  or die "could not close \"$filename\": $^E\n";
-	}
-	$contents =~ s/\r//g if $Config{osname} eq 'msys';
+	open(my $in, '<', $filename)
+	  or die "could not read \"$filename\": $!";
+	my $contents = <$in>;
+	close $in;
+	$contents =~ s/\r\n/\n/g if $Config{osname} eq 'msys';
 	return $contents;
 }
-
-=pod
-
-=item append_to_file(filename, str)
-
-Append a string at the end of a given file.  (Note: no newline is appended at
-end of file.)
-
-=cut
 
 sub append_to_file
 {
@@ -453,15 +274,8 @@ sub append_to_file
 	return;
 }
 
-=pod
-
-=item check_mode_recursive(dir, expected_dir_mode, expected_file_mode, ignore_list)
-
-Check that all file/dir modes in a directory match the expected values,
-ignoring files in C<ignore_list> (basename only).
-
-=cut
-
+# Check that all file/dir modes in a directory match the expected values,
+# ignoring the mode of any specified files.
 sub check_mode_recursive
 {
 	my ($dir, $expected_dir_mode, $expected_file_mode, $ignore_list) = @_;
@@ -544,14 +358,7 @@ sub check_mode_recursive
 	return $result;
 }
 
-=pod
-
-=item chmod_recursive(dir, dir_mode, file_mode)
-
-C<chmod> recursively each file and directory within the given directory.
-
-=cut
-
+# Change mode recursively on a directory
 sub chmod_recursive
 {
 	my ($dir, $dir_mode, $file_mode) = @_;
@@ -575,15 +382,9 @@ sub chmod_recursive
 	return;
 }
 
-=pod
-
-=item check_pg_config(regexp)
-
-Return the number of matches of the given regular expression
-within the installation's C<pg_config.h>.
-
-=cut
-
+# Check presence of a given regexp within pg_config.h for the installation
+# where tests are running, returning a match status result depending on
+# that.
 sub check_pg_config
 {
 	my ($regexp) = @_;
@@ -600,20 +401,9 @@ sub check_pg_config
 	return $match;
 }
 
-=pod
-
-=back
-
-=head1 Test::More-LIKE METHODS
-
-=over
-
-=item command_ok(cmd, test_name)
-
-Check that the command runs (via C<run_log>) successfully.
-
-=cut
-
+#
+# Test functions
+#
 sub command_ok
 {
 	local $Test::Builder::Level = $Test::Builder::Level + 1;
@@ -623,14 +413,6 @@ sub command_ok
 	return;
 }
 
-=pod
-
-=item command_fails(cmd, test_name)
-
-Check that the command fails (when run via C<run_log>).
-
-=cut
-
 sub command_fails
 {
 	local $Test::Builder::Level = $Test::Builder::Level + 1;
@@ -639,14 +421,6 @@ sub command_fails
 	ok(!$result, $test_name);
 	return;
 }
-
-=pod
-
-=item command_exit_is(cmd, expected, test_name)
-
-Check that the command exit code matches the expected exit code.
-
-=cut
 
 sub command_exit_is
 {
@@ -662,7 +436,7 @@ sub command_exit_is
 	# header file). IPC::Run's result function always returns exit code >> 8,
 	# assuming the Unix convention, which will always return 0 on Windows as
 	# long as the process was not terminated by an exception. To work around
-	# that, use $h->full_results on Windows instead.
+	# that, use $h->full_result on Windows instead.
 	my $result =
 	    ($Config{osname} eq "MSWin32")
 	  ? ($h->full_results)[0]
@@ -670,14 +444,6 @@ sub command_exit_is
 	is($result, $expected, $test_name);
 	return;
 }
-
-=pod
-
-=item program_help_ok(cmd)
-
-Check that the command supports the C<--help> option.
-
-=cut
 
 sub program_help_ok
 {
@@ -693,14 +459,6 @@ sub program_help_ok
 	return;
 }
 
-=pod
-
-=item program_version_ok(cmd)
-
-Check that the command supports the C<--version> option.
-
-=cut
-
 sub program_version_ok
 {
 	local $Test::Builder::Level = $Test::Builder::Level + 1;
@@ -714,15 +472,6 @@ sub program_version_ok
 	is($stderr, '', "$cmd --version nothing to stderr");
 	return;
 }
-
-=pod
-
-=item program_options_handling_ok(cmd)
-
-Check that a command with an invalid option returns a non-zero
-exit code and error message.
-
-=cut
 
 sub program_options_handling_ok
 {
@@ -738,15 +487,6 @@ sub program_options_handling_ok
 	return;
 }
 
-=pod
-
-=item command_like(cmd, expected_stdout, test_name)
-
-Check that the command runs successfully and the output
-matches the given regular expression.
-
-=cut
-
 sub command_like
 {
 	local $Test::Builder::Level = $Test::Builder::Level + 1;
@@ -759,16 +499,6 @@ sub command_like
 	like($stdout, $expected_stdout, "$test_name: matches");
 	return;
 }
-
-=pod
-
-=item command_like_safe(cmd, expected_stdout, test_name)
-
-Check that the command runs successfully and the output
-matches the given regular expression.  Doesn't assume that the
-output files are closed.
-
-=cut
 
 sub command_like_safe
 {
@@ -791,15 +521,6 @@ sub command_like_safe
 	return;
 }
 
-=pod
-
-=item command_fails_like(cmd, expected_stderr, test_name)
-
-Check that the command fails and the error message matches
-the given regular expression.
-
-=cut
-
 sub command_fails_like
 {
 	local $Test::Builder::Level = $Test::Builder::Level + 1;
@@ -812,29 +533,13 @@ sub command_fails_like
 	return;
 }
 
-=pod
-
-=item command_checks_all(cmd, ret, out, err, test_name)
-
-Run a command and check its status and outputs.
-Arguments:
-
-=over
-
-=item C<cmd>: Array reference of command and arguments to run
-
-=item C<ret>: Expected exit code
-
-=item C<out>: Expected stdout from command
-
-=item C<err>: Expected stderr from command
-
-=item C<test_name>: test name
-
-=back
-
-=cut
-
+# Run a command and check its status and outputs.
+# The 5 arguments are:
+# - cmd: ref to list for command, options and arguments to run
+# - ret: expected exit status
+# - out: ref to list of re to be checked against stdout (all must match)
+# - err: ref to list of re to be checked against stderr (all must match)
+# - test_name: name of test
 sub command_checks_all
 {
 	local $Test::Builder::Level = $Test::Builder::Level + 1;
@@ -870,11 +575,5 @@ sub command_checks_all
 
 	return;
 }
-
-=pod
-
-=back
-
-=cut
 
 1;

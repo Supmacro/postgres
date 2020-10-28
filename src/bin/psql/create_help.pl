@@ -1,9 +1,9 @@
-#! /usr/bin/perl
+#! /usr/bin/perl -w
 
 #################################################################
 # create_help.pl -- converts SGML docs to internal psql help
 #
-# Copyright (c) 2000-2020, PostgreSQL Global Development Group
+# Copyright (c) 2000-2019, PostgreSQL Global Development Group
 #
 # src/bin/psql/create_help.pl
 #################################################################
@@ -20,7 +20,6 @@
 #
 
 use strict;
-use warnings;
 
 my $docdir = $ARGV[0] or die "$0: missing required argument: docdir\n";
 my $hfile = $ARGV[1] . '.h'

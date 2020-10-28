@@ -3,7 +3,7 @@
  * nbtsplitloc.c
  *	  Choose split point code for Postgres btree implementation.
  *
- * Portions Copyright (c) 1996-2020, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2019, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,6 +16,10 @@
 
 #include "access/nbtree.h"
 #include "storage/lmgr.h"
+
+/* limits on split interval (default strategy only) */
+#define MAX_LEAF_INTERVAL			9
+#define MAX_INTERNAL_INTERVAL		18
 
 typedef enum
 {
@@ -33,7 +37,7 @@ typedef struct
 	int16		rightfree;		/* space left on right page post-split */
 
 	/* split point identifying fields (returned by _bt_findsplitloc) */
-	OffsetNumber firstrightoff; /* first origpage item on rightpage */
+	OffsetNumber firstoldonright;	/* first item on new right page */
 	bool		newitemonleft;	/* new item goes on left, or right? */
 
 } SplitPoint;
@@ -42,7 +46,7 @@ typedef struct
 {
 	/* context data for _bt_recsplitloc */
 	Relation	rel;			/* index relation */
-	Page		origpage;		/* page undergoing split */
+	Page		page;			/* page undergoing split */
 	IndexTuple	newitem;		/* new item (cause of page split) */
 	Size		newitemsz;		/* size of newitem (includes line pointer) */
 	bool		is_leaf;		/* T if splitting a leaf page */
@@ -51,7 +55,7 @@ typedef struct
 	int			leftspace;		/* space available for items on left page */
 	int			rightspace;		/* space available for items on right page */
 	int			olddataitemstotal;	/* space taken by old items */
-	Size		minfirstrightsz;	/* smallest firstright size */
+	Size		minfirstrightsz;	/* smallest firstoldonright tuple size */
 
 	/* candidate split point data */
 	int			maxsplits;		/* maximum number of splits */
@@ -61,9 +65,8 @@ typedef struct
 } FindSplitData;
 
 static void _bt_recsplitloc(FindSplitData *state,
-							OffsetNumber firstrightoff, bool newitemonleft,
-							int olddataitemstoleft,
-							Size firstrightofforigpagetuplesz);
+							OffsetNumber firstoldonright, bool newitemonleft,
+							int olddataitemstoleft, Size firstoldonrightsz);
 static void _bt_deltasortsplits(FindSplitData *state, double fillfactormult,
 								bool usemult);
 static int	_bt_splitcmp(const void *arg1, const void *arg2);
@@ -72,7 +75,6 @@ static bool _bt_afternewitemoff(FindSplitData *state, OffsetNumber maxoff,
 static bool _bt_adjacenthtid(ItemPointer lowhtid, ItemPointer highhtid);
 static OffsetNumber _bt_bestsplitloc(FindSplitData *state, int perfectpenalty,
 									 bool *newitemonleft, FindSplitStrat strategy);
-static int	_bt_defaultinterval(FindSplitData *state);
 static int	_bt_strategy(FindSplitData *state, SplitPoint *leftpage,
 						 SplitPoint *rightpage, FindSplitStrat *strategy);
 static void _bt_interval_edges(FindSplitData *state,
@@ -117,18 +119,13 @@ static inline IndexTuple _bt_split_firstright(FindSplitData *state,
  * suffix truncation.
  *
  * We return the index of the first existing tuple that should go on the
- * righthand page (which is called firstrightoff), plus a boolean
- * indicating whether the new tuple goes on the left or right page.  You
- * can think of the returned state as a point _between_ two adjacent data
- * items (laftleft and firstright data items) on an imaginary version of
- * origpage that already includes newitem.  The bool is necessary to
- * disambiguate the case where firstrightoff == newitemoff (i.e. it is
- * sometimes needed to determine if the firstright tuple for the split is
- * newitem rather than the tuple from origpage at offset firstrightoff).
+ * righthand page, plus a boolean indicating whether the new tuple goes on
+ * the left or right page.  The bool is necessary to disambiguate the case
+ * where firstright == newitemoff.
  */
 OffsetNumber
 _bt_findsplitloc(Relation rel,
-				 Page origpage,
+				 Page page,
 				 OffsetNumber newitemoff,
 				 Size newitemsz,
 				 IndexTuple newitem,
@@ -146,36 +143,36 @@ _bt_findsplitloc(Relation rel,
 	ItemId		itemid;
 	OffsetNumber offnum,
 				maxoff,
-				firstrightoff;
+				foundfirstright;
 	double		fillfactormult;
 	bool		usemult;
 	SplitPoint	leftpage,
 				rightpage;
 
-	opaque = (BTPageOpaque) PageGetSpecialPointer(origpage);
-	maxoff = PageGetMaxOffsetNumber(origpage);
+	opaque = (BTPageOpaque) PageGetSpecialPointer(page);
+	maxoff = PageGetMaxOffsetNumber(page);
 
 	/* Total free space available on a btree page, after fixed overhead */
 	leftspace = rightspace =
-		PageGetPageSize(origpage) - SizeOfPageHeaderData -
+		PageGetPageSize(page) - SizeOfPageHeaderData -
 		MAXALIGN(sizeof(BTPageOpaqueData));
 
 	/* The right page will have the same high key as the old page */
 	if (!P_RIGHTMOST(opaque))
 	{
-		itemid = PageGetItemId(origpage, P_HIKEY);
+		itemid = PageGetItemId(page, P_HIKEY);
 		rightspace -= (int) (MAXALIGN(ItemIdGetLength(itemid)) +
 							 sizeof(ItemIdData));
 	}
 
 	/* Count up total space in data items before actually scanning 'em */
-	olddataitemstotal = rightspace - (int) PageGetExactFreeSpace(origpage);
-	leaffillfactor = BTGetFillFactor(rel);
+	olddataitemstotal = rightspace - (int) PageGetExactFreeSpace(page);
+	leaffillfactor = RelationGetFillFactor(rel, BTREE_DEFAULT_FILLFACTOR);
 
 	/* Passed-in newitemsz is MAXALIGNED but does not include line pointer */
 	newitemsz += sizeof(ItemIdData);
 	state.rel = rel;
-	state.origpage = origpage;
+	state.page = page;
 	state.newitem = newitem;
 	state.newitemsz = newitemsz;
 	state.is_leaf = P_ISLEAF(opaque);
@@ -185,9 +182,6 @@ _bt_findsplitloc(Relation rel,
 	state.olddataitemstotal = olddataitemstotal;
 	state.minfirstrightsz = SIZE_MAX;
 	state.newitemoff = newitemoff;
-
-	/* newitem cannot be a posting list item */
-	Assert(!BTreeTupleIsPosting(newitem));
 
 	/*
 	 * maxsplits should never exceed maxoff because there will be at most as
@@ -212,7 +206,7 @@ _bt_findsplitloc(Relation rel,
 	{
 		Size		itemsz;
 
-		itemid = PageGetItemId(origpage, offnum);
+		itemid = PageGetItemId(page, offnum);
 		itemsz = MAXALIGN(ItemIdGetLength(itemid)) + sizeof(ItemIdData);
 
 		/*
@@ -276,7 +270,7 @@ _bt_findsplitloc(Relation rel,
 	 * left side of the split, in order to maximize the number of trailing
 	 * attributes that can be truncated away.  Only candidate split points
 	 * that imply an acceptable balance of free space on each side are
-	 * considered.  See _bt_defaultinterval().
+	 * considered.
 	 */
 	if (!state.is_leaf)
 	{
@@ -296,7 +290,8 @@ _bt_findsplitloc(Relation rel,
 		 * New item inserted at rightmost point among a localized grouping on
 		 * a leaf page -- apply "split after new item" optimization, either by
 		 * applying leaf fillfactor multiplier, or by choosing the exact split
-		 * point that leaves newitem as lastleft. (usemult is set for us.)
+		 * point that leaves the new item as last on the left. (usemult is set
+		 * for us.)
 		 */
 		if (usemult)
 		{
@@ -311,7 +306,7 @@ _bt_findsplitloc(Relation rel,
 				SplitPoint *split = state.splits + i;
 
 				if (split->newitemonleft &&
-					newitemoff == split->firstrightoff)
+					newitemoff == split->firstoldonright)
 				{
 					pfree(state.splits);
 					*newitemonleft = true;
@@ -336,6 +331,19 @@ _bt_findsplitloc(Relation rel,
 	}
 
 	/*
+	 * Set an initial limit on the split interval/number of candidate split
+	 * points as appropriate.  The "Prefix B-Trees" paper refers to this as
+	 * sigma l for leaf splits and sigma b for internal ("branch") splits.
+	 * It's hard to provide a theoretical justification for the initial size
+	 * of the split interval, though it's clear that a small split interval
+	 * makes suffix truncation much more effective without noticeably
+	 * affecting space utilization over time.
+	 */
+	state.interval = Min(Max(1, state.nsplits * 0.05),
+						 state.is_leaf ? MAX_LEAF_INTERVAL :
+						 MAX_INTERNAL_INTERVAL);
+
+	/*
 	 * Save leftmost and rightmost splits for page before original ordinal
 	 * sort order is lost by delta/fillfactormult sort
 	 */
@@ -344,9 +352,6 @@ _bt_findsplitloc(Relation rel,
 
 	/* Give split points a fillfactormult-wise delta, and sort on deltas */
 	_bt_deltasortsplits(&state, fillfactormult, usemult);
-
-	/* Determine split interval for default strategy */
-	state.interval = _bt_defaultinterval(&state);
 
 	/*
 	 * Determine if default strategy/split interval will produce a
@@ -421,26 +426,24 @@ _bt_findsplitloc(Relation rel,
 	 * the entry that has the lowest penalty, and is therefore expected to
 	 * maximize fan-out.  Sets *newitemonleft for us.
 	 */
-	firstrightoff = _bt_bestsplitloc(&state, perfectpenalty, newitemonleft,
-									 strategy);
+	foundfirstright = _bt_bestsplitloc(&state, perfectpenalty, newitemonleft,
+									   strategy);
 	pfree(state.splits);
 
-	return firstrightoff;
+	return foundfirstright;
 }
 
 /*
  * Subroutine to record a particular point between two tuples (possibly the
- * new item) on page (ie, combination of firstrightoff and newitemonleft
- * settings) in *state for later analysis.  This is also a convenient point to
- * check if the split is legal (if it isn't, it won't be recorded).
+ * new item) on page (ie, combination of firstright and newitemonleft
+ * settings) in *state for later analysis.  This is also a convenient point
+ * to check if the split is legal (if it isn't, it won't be recorded).
  *
- * firstrightoff is the offset of the first item on the original page that
- * goes to the right page, and firstrightofforigpagetuplesz is the size of
- * that tuple.  firstrightoff can be > max offset, which means that all the
- * old items go to the left page and only the new item goes to the right page.
- * We don't actually use firstrightofforigpagetuplesz in that case (actually,
- * we don't use it for _any_ split where the firstright tuple happens to be
- * newitem).
+ * firstoldonright is the offset of the first item on the original page that
+ * goes to the right page, and firstoldonrightsz is the size of that tuple.
+ * firstoldonright can be > max offset, which means that all the old items go
+ * to the left page and only the new item goes to the right page.  In that
+ * case, firstoldonrightsz is not used.
  *
  * olddataitemstoleft is the total size of all old items to the left of the
  * split point that is recorded here when legal.  Should not include
@@ -448,50 +451,24 @@ _bt_findsplitloc(Relation rel,
  */
 static void
 _bt_recsplitloc(FindSplitData *state,
-				OffsetNumber firstrightoff,
+				OffsetNumber firstoldonright,
 				bool newitemonleft,
 				int olddataitemstoleft,
-				Size firstrightofforigpagetuplesz)
+				Size firstoldonrightsz)
 {
 	int16		leftfree,
 				rightfree;
-	Size		firstrightsz;
-	Size		postingsz = 0;
-	bool		newitemisfirstright;
+	Size		firstrightitemsz;
+	bool		newitemisfirstonright;
 
-	/* Is the new item going to be split point's firstright tuple? */
-	newitemisfirstright = (firstrightoff == state->newitemoff &&
-						   !newitemonleft);
+	/* Is the new item going to be the first item on the right page? */
+	newitemisfirstonright = (firstoldonright == state->newitemoff
+							 && !newitemonleft);
 
-	if (newitemisfirstright)
-		firstrightsz = state->newitemsz;
+	if (newitemisfirstonright)
+		firstrightitemsz = state->newitemsz;
 	else
-	{
-		firstrightsz = firstrightofforigpagetuplesz;
-
-		/*
-		 * Calculate suffix truncation space saving when firstright tuple is a
-		 * posting list tuple, though only when the tuple is over 64 bytes
-		 * including line pointer overhead (arbitrary).  This avoids accessing
-		 * the tuple in cases where its posting list must be very small (if
-		 * tuple has one at all).
-		 *
-		 * Note: We don't do this in the case where firstright tuple is
-		 * newitem, since newitem cannot have a posting list.
-		 */
-		if (state->is_leaf && firstrightsz > 64)
-		{
-			ItemId		itemid;
-			IndexTuple	newhighkey;
-
-			itemid = PageGetItemId(state->origpage, firstrightoff);
-			newhighkey = (IndexTuple) PageGetItem(state->origpage, itemid);
-
-			if (BTreeTupleIsPosting(newhighkey))
-				postingsz = IndexTupleSize(newhighkey) -
-					BTreeTupleGetPostingOffset(newhighkey);
-		}
-	}
+		firstrightitemsz = firstoldonrightsz;
 
 	/* Account for all the old tuples */
 	leftfree = state->leftspace - olddataitemstoleft;
@@ -514,19 +491,13 @@ _bt_recsplitloc(FindSplitData *state,
 	 * If we are on the leaf level, assume that suffix truncation cannot avoid
 	 * adding a heap TID to the left half's new high key when splitting at the
 	 * leaf level.  In practice the new high key will often be smaller and
-	 * will rarely be larger, but conservatively assume the worst case.  We do
-	 * go to the trouble of subtracting away posting list overhead, though
-	 * only when it looks like it will make an appreciable difference.
-	 * (Posting lists are the only case where truncation will typically make
-	 * the final high key far smaller than firstright, so being a bit more
-	 * precise there noticeably improves the balance of free space.)
+	 * will rarely be larger, but conservatively assume the worst case.
 	 */
 	if (state->is_leaf)
-		leftfree -= (int16) (firstrightsz +
-							 MAXALIGN(sizeof(ItemPointerData)) -
-							 postingsz);
+		leftfree -= (int16) (firstrightitemsz +
+							 MAXALIGN(sizeof(ItemPointerData)));
 	else
-		leftfree -= (int16) firstrightsz;
+		leftfree -= (int16) firstrightitemsz;
 
 	/* account for the new item */
 	if (newitemonleft)
@@ -539,7 +510,7 @@ _bt_recsplitloc(FindSplitData *state,
 	 * data from the first item that winds up on the right page.
 	 */
 	if (!state->is_leaf)
-		rightfree += (int16) firstrightsz -
+		rightfree += (int16) firstrightitemsz -
 			(int16) (MAXALIGN(sizeof(IndexTupleData)) + sizeof(ItemIdData));
 
 	/* Record split if legal */
@@ -547,13 +518,13 @@ _bt_recsplitloc(FindSplitData *state,
 	{
 		Assert(state->nsplits < state->maxsplits);
 
-		/* Determine smallest firstright tuple size among legal splits */
-		state->minfirstrightsz = Min(state->minfirstrightsz, firstrightsz);
+		/* Determine smallest firstright item size on page */
+		state->minfirstrightsz = Min(state->minfirstrightsz, firstrightitemsz);
 
 		state->splits[state->nsplits].curdelta = 0;
 		state->splits[state->nsplits].leftfree = leftfree;
 		state->splits[state->nsplits].rightfree = rightfree;
-		state->splits[state->nsplits].firstrightoff = firstrightoff;
+		state->splits[state->nsplits].firstoldonright = firstoldonright;
 		state->splits[state->nsplits].newitemonleft = newitemonleft;
 		state->nsplits++;
 	}
@@ -629,8 +600,8 @@ _bt_splitcmp(const void *arg1, const void *arg2)
  * taken by caller varies.  Caller uses original leaf page fillfactor in
  * standard way rather than using the new item offset directly when *usemult
  * was also set to true here.  Otherwise, caller applies optimization by
- * locating the legal split point that makes the new tuple the lastleft tuple
- * for the split.
+ * locating the legal split point that makes the new tuple the very last tuple
+ * on the left side of the split.
  */
 static bool
 _bt_afternewitemoff(FindSplitData *state, OffsetNumber maxoff,
@@ -691,8 +662,8 @@ _bt_afternewitemoff(FindSplitData *state, OffsetNumber maxoff,
 	 */
 	if (state->newitemoff > maxoff)
 	{
-		itemid = PageGetItemId(state->origpage, maxoff);
-		tup = (IndexTuple) PageGetItem(state->origpage, itemid);
+		itemid = PageGetItemId(state->page, maxoff);
+		tup = (IndexTuple) PageGetItem(state->page, itemid);
 		keepnatts = _bt_keep_natts_fast(state->rel, tup, state->newitem);
 
 		if (keepnatts > 1 && keepnatts <= nkeyatts)
@@ -717,11 +688,10 @@ _bt_afternewitemoff(FindSplitData *state, OffsetNumber maxoff,
 	 * optimization.  Besides, all inappropriate cases triggered here will
 	 * still split in the middle of the page on average.
 	 */
-	itemid = PageGetItemId(state->origpage, OffsetNumberPrev(state->newitemoff));
-	tup = (IndexTuple) PageGetItem(state->origpage, itemid);
+	itemid = PageGetItemId(state->page, OffsetNumberPrev(state->newitemoff));
+	tup = (IndexTuple) PageGetItem(state->page, itemid);
 	/* Do cheaper test first */
-	if (BTreeTupleIsPosting(tup) ||
-		!_bt_adjacenthtid(&tup->t_tid, &state->newitem->t_tid))
+	if (!_bt_adjacenthtid(&tup->t_tid, &state->newitem->t_tid))
 		return false;
 	/* Check same conditions as rightmost item case, too */
 	keepnatts = _bt_keep_natts_fast(state->rel, tup, state->newitem);
@@ -807,14 +777,18 @@ _bt_bestsplitloc(FindSplitData *state, int perfectpenalty,
 
 		penalty = _bt_split_penalty(state, state->splits + i);
 
+		if (penalty <= perfectpenalty)
+		{
+			bestpenalty = penalty;
+			lowsplit = i;
+			break;
+		}
+
 		if (penalty < bestpenalty)
 		{
 			bestpenalty = penalty;
 			lowsplit = i;
 		}
-
-		if (penalty <= perfectpenalty)
-			break;
 	}
 
 	final = &state->splits[lowsplit];
@@ -836,93 +810,18 @@ _bt_bestsplitloc(FindSplitData *state, int perfectpenalty,
 	 * leftmost page.
 	 */
 	if (strategy == SPLIT_MANY_DUPLICATES && !state->is_rightmost &&
-		!final->newitemonleft && final->firstrightoff >= state->newitemoff &&
-		final->firstrightoff < state->newitemoff + 9)
+		!final->newitemonleft && final->firstoldonright >= state->newitemoff &&
+		final->firstoldonright < state->newitemoff + MAX_LEAF_INTERVAL)
 	{
 		/*
-		 * Avoid the problem by performing a 50:50 split when the new item is
+		 * Avoid the problem by peforming a 50:50 split when the new item is
 		 * just to the right of the would-be "many duplicates" split point.
-		 * (Note that the test used for an insert that is "just to the right"
-		 * of the split point is conservative.)
 		 */
 		final = &state->splits[0];
 	}
 
 	*newitemonleft = final->newitemonleft;
-	return final->firstrightoff;
-}
-
-#define LEAF_SPLIT_DISTANCE			0.050
-#define INTERNAL_SPLIT_DISTANCE		0.075
-
-/*
- * Return a split interval to use for the default strategy.  This is a limit
- * on the number of candidate split points to give further consideration to.
- * Only a fraction of all candidate splits points (those located at the start
- * of the now-sorted splits array) fall within the split interval.  Split
- * interval is applied within _bt_bestsplitloc().
- *
- * Split interval represents an acceptable range of split points -- those that
- * have leftfree and rightfree values that are acceptably balanced.  The final
- * split point chosen is the split point with the lowest "penalty" among split
- * points in this split interval (unless we change our entire strategy, in
- * which case the interval also changes -- see _bt_strategy()).
- *
- * The "Prefix B-Trees" paper calls split interval sigma l for leaf splits,
- * and sigma b for internal ("branch") splits.  It's hard to provide a
- * theoretical justification for the size of the split interval, though it's
- * clear that a small split interval can make tuples on level L+1 much smaller
- * on average, without noticeably affecting space utilization on level L.
- * (Note that the way that we calculate split interval might need to change if
- * suffix truncation is taught to truncate tuples "within" the last
- * attribute/datum for data types like text, which is more or less how it is
- * assumed to work in the paper.)
- */
-static int
-_bt_defaultinterval(FindSplitData *state)
-{
-	SplitPoint *spaceoptimal;
-	int16		tolerance,
-				lowleftfree,
-				lowrightfree,
-				highleftfree,
-				highrightfree;
-
-	/*
-	 * Determine leftfree and rightfree values that are higher and lower than
-	 * we're willing to tolerate.  Note that the final split interval will be
-	 * about 10% of nsplits in the common case where all non-pivot tuples
-	 * (data items) from a leaf page are uniformly sized.  We're a bit more
-	 * aggressive when splitting internal pages.
-	 */
-	if (state->is_leaf)
-		tolerance = state->olddataitemstotal * LEAF_SPLIT_DISTANCE;
-	else
-		tolerance = state->olddataitemstotal * INTERNAL_SPLIT_DISTANCE;
-
-	/* First candidate split point is the most evenly balanced */
-	spaceoptimal = state->splits;
-	lowleftfree = spaceoptimal->leftfree - tolerance;
-	lowrightfree = spaceoptimal->rightfree - tolerance;
-	highleftfree = spaceoptimal->leftfree + tolerance;
-	highrightfree = spaceoptimal->rightfree + tolerance;
-
-	/*
-	 * Iterate through split points, starting from the split immediately after
-	 * 'spaceoptimal'.  Find the first split point that divides free space so
-	 * unevenly that including it in the split interval would be unacceptable.
-	 */
-	for (int i = 1; i < state->nsplits; i++)
-	{
-		SplitPoint *split = state->splits + i;
-
-		/* Cannot use curdelta here, since its value is often weighted */
-		if (split->leftfree < lowleftfree || split->rightfree < lowrightfree ||
-			split->leftfree > highleftfree || split->rightfree > highrightfree)
-			return i;
-	}
-
-	return state->nsplits;
+	return final->firstoldonright;
 }
 
 /*
@@ -951,11 +850,10 @@ _bt_strategy(FindSplitData *state, SplitPoint *leftpage,
 	*strategy = SPLIT_DEFAULT;
 
 	/*
-	 * Use smallest observed firstright item size for entire page (actually,
-	 * entire imaginary version of page that includes newitem) as perfect
+	 * Use smallest observed first right item size for entire page as perfect
 	 * penalty on internal pages.  This can save cycles in the common case
-	 * where most or all splits (not just splits within interval) have
-	 * firstright tuples that are the same size.
+	 * where most or all splits (not just splits within interval) have first
+	 * right tuples that are the same size.
 	 */
 	if (!state->is_leaf)
 		return state->minfirstrightsz;
@@ -1030,8 +928,8 @@ _bt_strategy(FindSplitData *state, SplitPoint *leftpage,
 		ItemId		itemid;
 		IndexTuple	hikey;
 
-		itemid = PageGetItemId(state->origpage, P_HIKEY);
-		hikey = (IndexTuple) PageGetItem(state->origpage, itemid);
+		itemid = PageGetItemId(state->page, P_HIKEY);
+		hikey = (IndexTuple) PageGetItem(state->page, itemid);
 		perfectpenalty = _bt_keep_natts_fast(state->rel, hikey,
 											 state->newitem);
 		if (perfectpenalty <= indnkeyatts)
@@ -1074,12 +972,12 @@ _bt_interval_edges(FindSplitData *state, SplitPoint **leftinterval,
 	{
 		SplitPoint *distant = state->splits + i;
 
-		if (distant->firstrightoff < deltaoptimal->firstrightoff)
+		if (distant->firstoldonright < deltaoptimal->firstoldonright)
 		{
 			if (*leftinterval == NULL)
 				*leftinterval = distant;
 		}
-		else if (distant->firstrightoff > deltaoptimal->firstrightoff)
+		else if (distant->firstoldonright > deltaoptimal->firstoldonright)
 		{
 			if (*rightinterval == NULL)
 				*rightinterval = distant;
@@ -1087,20 +985,22 @@ _bt_interval_edges(FindSplitData *state, SplitPoint **leftinterval,
 		else if (!distant->newitemonleft && deltaoptimal->newitemonleft)
 		{
 			/*
-			 * "incoming tuple will become firstright" (distant) is to the
-			 * left of "incoming tuple will become lastleft" (delta-optimal)
+			 * "incoming tuple will become first on right page" (distant) is
+			 * to the left of "incoming tuple will become last on left page"
+			 * (delta-optimal)
 			 */
-			Assert(distant->firstrightoff == state->newitemoff);
+			Assert(distant->firstoldonright == state->newitemoff);
 			if (*leftinterval == NULL)
 				*leftinterval = distant;
 		}
 		else if (distant->newitemonleft && !deltaoptimal->newitemonleft)
 		{
 			/*
-			 * "incoming tuple will become lastleft" (distant) is to the right
-			 * of "incoming tuple will become firstright" (delta-optimal)
+			 * "incoming tuple will become last on left page" (distant) is to
+			 * the right of "incoming tuple will become first on right page"
+			 * (delta-optimal)
 			 */
-			Assert(distant->firstrightoff == state->newitemoff);
+			Assert(distant->firstoldonright == state->newitemoff);
 			if (*rightinterval == NULL)
 				*rightinterval = distant;
 		}
@@ -1129,62 +1029,63 @@ _bt_interval_edges(FindSplitData *state, SplitPoint **leftinterval,
  * key for left page.  It can be greater than the number of key attributes in
  * cases where a heap TID will need to be appended during truncation.
  *
- * On internal pages, penalty is simply the size of the firstright tuple for
- * the split (including line pointer overhead).  This tuple will become the
- * new high key for the left page.
+ * On internal pages, penalty is simply the size of the first item on the
+ * right half of the split (including line pointer overhead).  This tuple will
+ * become the new high key for the left page.
  */
 static inline int
 _bt_split_penalty(FindSplitData *state, SplitPoint *split)
 {
-	IndexTuple	lastleft;
-	IndexTuple	firstright;
+	IndexTuple	lastleftuple;
+	IndexTuple	firstrighttuple;
 
 	if (!state->is_leaf)
 	{
 		ItemId		itemid;
 
 		if (!split->newitemonleft &&
-			split->firstrightoff == state->newitemoff)
+			split->firstoldonright == state->newitemoff)
 			return state->newitemsz;
 
-		itemid = PageGetItemId(state->origpage, split->firstrightoff);
+		itemid = PageGetItemId(state->page, split->firstoldonright);
 
 		return MAXALIGN(ItemIdGetLength(itemid)) + sizeof(ItemIdData);
 	}
 
-	lastleft = _bt_split_lastleft(state, split);
-	firstright = _bt_split_firstright(state, split);
+	lastleftuple = _bt_split_lastleft(state, split);
+	firstrighttuple = _bt_split_firstright(state, split);
 
-	return _bt_keep_natts_fast(state->rel, lastleft, firstright);
+	Assert(lastleftuple != firstrighttuple);
+	return _bt_keep_natts_fast(state->rel, lastleftuple, firstrighttuple);
 }
 
 /*
- * Subroutine to get a lastleft IndexTuple for a split point
+ * Subroutine to get a lastleft IndexTuple for a spit point from page
  */
 static inline IndexTuple
 _bt_split_lastleft(FindSplitData *state, SplitPoint *split)
 {
 	ItemId		itemid;
 
-	if (split->newitemonleft && split->firstrightoff == state->newitemoff)
+	if (split->newitemonleft && split->firstoldonright == state->newitemoff)
 		return state->newitem;
 
-	itemid = PageGetItemId(state->origpage,
-						   OffsetNumberPrev(split->firstrightoff));
-	return (IndexTuple) PageGetItem(state->origpage, itemid);
+	itemid = PageGetItemId(state->page,
+						   OffsetNumberPrev(split->firstoldonright));
+	return (IndexTuple) PageGetItem(state->page, itemid);
 }
 
 /*
- * Subroutine to get a firstright IndexTuple for a split point
+ * Subroutine to get a firstright IndexTuple for a spit point from page
  */
 static inline IndexTuple
 _bt_split_firstright(FindSplitData *state, SplitPoint *split)
 {
 	ItemId		itemid;
 
-	if (!split->newitemonleft && split->firstrightoff == state->newitemoff)
+	if (!split->newitemonleft && split->firstoldonright == state->newitemoff)
 		return state->newitem;
 
-	itemid = PageGetItemId(state->origpage, split->firstrightoff);
-	return (IndexTuple) PageGetItem(state->origpage, itemid);
+	itemid = PageGetItemId(state->page, split->firstoldonright);
+	return (IndexTuple) PageGetItem(state->page, itemid);
 }

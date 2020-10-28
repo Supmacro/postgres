@@ -757,6 +757,28 @@ alter table atacc1
   add primary key(a);
 drop table atacc1;
 
+-- additionally, we've seen issues with foreign key validation not being
+-- properly delayed until after a table rewrite.  Check that works ok.
+create table atacc1 (a int primary key);
+alter table atacc1 add constraint atacc1_fkey foreign key (a) references atacc1 (a) not valid;
+alter table atacc1 validate constraint atacc1_fkey, alter a type bigint;
+drop table atacc1;
+
+-- we've also seen issues with check constraints being validated at the wrong
+-- time when there's a pending table rewrite.
+create table atacc1 (a bigint, b int);
+insert into atacc1 values(1,1);
+alter table atacc1 add constraint atacc1_chk check(b = 1) not valid;
+alter table atacc1 validate constraint atacc1_chk, alter a type int;
+drop table atacc1;
+
+-- same as above, but ensure the constraint violation is detected
+create table atacc1 (a bigint, b int);
+insert into atacc1 values(1,2);
+alter table atacc1 add constraint atacc1_chk check(b = 1) not valid;
+alter table atacc1 validate constraint atacc1_chk, alter a type int;
+drop table atacc1;
+
 -- something a little more complicated
 create table atacc1 ( test int, test2 int);
 -- add a primary key constraint
@@ -1342,30 +1364,21 @@ alter table anothertab alter column f5 type bigint;
 
 drop table anothertab;
 
--- test that USING expressions are parsed before column alter type / drop steps
-create table another (f1 int, f2 text, f3 text);
+create table another (f1 int, f2 text);
 
-insert into another values(1, 'one', 'uno');
-insert into another values(2, 'two', 'due');
-insert into another values(3, 'three', 'tre');
+insert into another values(1, 'one');
+insert into another values(2, 'two');
+insert into another values(3, 'three');
 
 select * from another;
 
 alter table another
-  alter f1 type text using f2 || ' and ' || f3 || ' more',
-  alter f2 type bigint using f1 * 10,
-  drop column f3;
+  alter f1 type text using f2 || ' more',
+  alter f2 type bigint using f1 * 10;
 
 select * from another;
 
 drop table another;
-
--- Create an index that skips WAL, then perform a SET DATA TYPE that skips
--- rewriting the index.
-begin;
-create table skip_wal_skip_rewrite_index (c varchar(10) primary key);
-alter table skip_wal_skip_rewrite_index alter c type varchar(20);
-commit;
 
 -- table's row type
 create table tab1 (a int, b text);
@@ -1651,7 +1664,7 @@ from pg_locks l join pg_class c on l.relation = c.oid
 where virtualtransaction = (
         select virtualtransaction
         from pg_locks
-        where transactionid = pg_current_xact_id()::xid)
+        where transactionid = txid_current()::integer)
 and locktype = 'relation'
 and relnamespace != (select oid from pg_namespace where nspname = 'pg_catalog')
 and c.relname != 'my_locks'
@@ -1738,7 +1751,7 @@ from pg_locks l join pg_class c on l.relation = c.oid
 where virtualtransaction = (
         select virtualtransaction
         from pg_locks
-        where transactionid = pg_current_xact_id()::xid)
+        where transactionid = txid_current()::integer)
 and locktype = 'relation'
 and relnamespace != (select oid from pg_namespace where nspname = 'pg_catalog')
 and c.relname = 'my_locks'
@@ -1813,7 +1826,7 @@ create operator alter1.=(procedure = alter1.same, leftarg  = alter1.ctype, right
 create operator class alter1.ctype_hash_ops default for type alter1.ctype using hash as
   operator 1 alter1.=(alter1.ctype, alter1.ctype);
 
-create conversion alter1.latin1_to_utf8 for 'latin1' to 'utf8' from iso8859_1_to_utf8;
+create conversion alter1.ascii_to_utf8 for 'sql_ascii' to 'utf8' from ascii_to_utf8;
 
 create text search parser alter1.prs(start = prsd_start, gettoken = prsd_nexttoken, end = prsd_end, lextypes = prsd_lextype);
 create text search configuration alter1.cfg(parser = alter1.prs);
@@ -1834,7 +1847,7 @@ alter operator alter1.=(alter1.ctype, alter1.ctype) set schema alter2;
 alter function alter1.same(alter1.ctype, alter1.ctype) set schema alter2;
 alter type alter1.ctype set schema alter1; -- no-op, same schema
 alter type alter1.ctype set schema alter2;
-alter conversion alter1.latin1_to_utf8 set schema alter2;
+alter conversion alter1.ascii_to_utf8 set schema alter2;
 alter text search parser alter1.prs set schema alter2;
 alter text search configuration alter1.cfg set schema alter2;
 alter text search template alter1.tmpl set schema alter2;
@@ -2094,6 +2107,10 @@ WHERE c.oid IS NOT NULL OR m.mapped_oid IS NOT NULL;
 
 -- Checks on creating and manipulation of user defined relations in
 -- pg_catalog.
+--
+-- XXX: It would be useful to add checks around trying to manipulate
+-- catalog tables, but that might have ugly consequences when run
+-- against an existing server with allow_system_table_mods = on.
 
 SHOW allow_system_table_mods;
 -- disallowed because of search_path issues with pg_dump
@@ -2185,50 +2202,22 @@ ALTER TABLE ONLY test_add_column
 \d test_add_column
 ALTER TABLE test_add_column
 	ADD COLUMN c2 integer, -- fail because c2 already exists
-	ADD COLUMN c3 integer primary key;
+	ADD COLUMN c3 integer;
 \d test_add_column
 ALTER TABLE test_add_column
 	ADD COLUMN IF NOT EXISTS c2 integer, -- skipping because c2 already exists
-	ADD COLUMN c3 integer primary key;
+	ADD COLUMN c3 integer; -- fail because c3 already exists
 \d test_add_column
 ALTER TABLE test_add_column
 	ADD COLUMN IF NOT EXISTS c2 integer, -- skipping because c2 already exists
-	ADD COLUMN IF NOT EXISTS c3 integer primary key; -- skipping because c3 already exists
+	ADD COLUMN IF NOT EXISTS c3 integer; -- skipping because c3 already exists
 \d test_add_column
 ALTER TABLE test_add_column
 	ADD COLUMN IF NOT EXISTS c2 integer, -- skipping because c2 already exists
 	ADD COLUMN IF NOT EXISTS c3 integer, -- skipping because c3 already exists
-	ADD COLUMN c4 integer REFERENCES test_add_column;
+	ADD COLUMN c4 integer;
 \d test_add_column
-ALTER TABLE test_add_column
-	ADD COLUMN IF NOT EXISTS c4 integer REFERENCES test_add_column;
-\d test_add_column
-ALTER TABLE test_add_column
-	ADD COLUMN IF NOT EXISTS c5 SERIAL CHECK (c5 > 8);
-\d test_add_column
-ALTER TABLE test_add_column
-	ADD COLUMN IF NOT EXISTS c5 SERIAL CHECK (c5 > 10);
-\d test_add_column*
 DROP TABLE test_add_column;
-\d test_add_column*
-
--- assorted cases with multiple ALTER TABLE steps
-CREATE TABLE ataddindex(f1 INT);
-INSERT INTO ataddindex VALUES (42), (43);
-CREATE UNIQUE INDEX ataddindexi0 ON ataddindex(f1);
-ALTER TABLE ataddindex
-  ADD PRIMARY KEY USING INDEX ataddindexi0,
-  ALTER f1 TYPE BIGINT;
-\d ataddindex
-DROP TABLE ataddindex;
-
-CREATE TABLE ataddindex(f1 VARCHAR(10));
-INSERT INTO ataddindex(f1) VALUES ('foo'), ('a');
-ALTER TABLE ataddindex
-  ALTER f1 SET DATA TYPE TEXT,
-  ADD EXCLUDE ((f1 LIKE 'a') WITH =);
-\d ataddindex
-DROP TABLE ataddindex;
 
 -- unsupported constraint types for partitioned tables
 CREATE TABLE partitioned (
@@ -2558,7 +2547,7 @@ DROP TABLE quuux;
 -- check validation when attaching hash partitions
 
 -- Use hand-rolled hash functions and operator class to get predictable result
--- on different matchines. part_test_int4_ops is defined in insert.sql.
+-- on different machines. part_test_int4_ops is defined in insert.sql.
 
 -- check that the new partition won't overlap with an existing partition
 CREATE TABLE hash_parted (
