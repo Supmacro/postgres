@@ -3242,6 +3242,14 @@ main(int argc, char *argv[])
 	/* If we only need to fsync, just do it and exit */
 	if (sync_only)
 	{
+        /* +==========================================================+ 
+         * | <Z>                                                      |
+         * | if(pg_data)                                              |
+         * |    putenv("PGDATA=")                                     |
+         * | else                                                     |
+         * |    getenv("PGDATA") ....                                 |
+         * +----------------------------------------------------------+
+         * */
 		setup_pgdata();
 
 		/* must check that directory is readable */
@@ -3253,6 +3261,9 @@ main(int argc, char *argv[])
 
 		fputs(_("syncing data to disk ... "), stdout);
 		fflush(stdout);
+
+         // <Z>                                           
+         // Recursion fsync("$pg_data/pg_wal")          
 		fsync_pgdata(pg_data, PG_VERSION_NUM);
 		check_ok();
 		return 0;
@@ -3297,8 +3308,14 @@ main(int argc, char *argv[])
 
 	get_restricted_token();
 
+     // | <Z>                                   
+     // | putenv("PGDATA=/usr/local/pgsql/data")
+     // |                                      
 	setup_pgdata();
 
+    // <Z>
+    // get share_path "/usr/local/pgsql/share"
+    //
 	setup_bin_paths(argv[0]);
 
 	effective_user = get_id();
@@ -3316,10 +3333,23 @@ main(int argc, char *argv[])
 			 "This user must also own the server process.\n\n"),
 		   effective_user);
 
+    // <Z>
+    // infoversion = "12.04.0000"
 	set_info_version();
 
+    // <Z>
+    // bki_file = "/usr/local/pgsql/share/postgres.bki"
+    // desc_file = "/usr/local/pgsql/share/postgres.description"
+    // shdesc_file = "/usr/local/pgsql/share/postgres.shdescription"
+    // ...
 	setup_data_file_paths();
 
+    // <Z>
+    // LC_CTYPE = "zh_CN.UTF-8"
+    // LC_COLLATE = ""
+    // LC_NUMERIC = ""
+    // LC_TIME = ""
+    // LC_MONETARY = ""
 	setup_locale_encoding();
 
 	setup_text_search();

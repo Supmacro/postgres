@@ -13,7 +13,12 @@ const char *pg_varenv[] = {
 
                 "PGLOCALEDIR",
                 "PGSYSCONFDIR", 
-                "PGDATA",
+                "PGDATA",           // PGDATA=/usr/local/pgsql/data
+                "PG_RESTRICT_EXEC", // [windows]
             };
 
-
+/* +==================================+
+ * | char *sys = nl_langinfo(CODESET) |
+ * +----------------------------------+
+ *
+ * */
